@@ -1,0 +1,80 @@
+name: release-appimage
+
+# Builds the Linux AppImage and publishes it to the GitHub Release for any
+# tag matching v*.*.*  (e.g. `git tag v0.2.0 && git push origin v0.2.0`).
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)publish, e.g. v0.2.0"
+        required: true
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  appimage:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    env:
+      PBS_TAG: 20261110
+      PBS_ASSET: cpython-3.12.16+20261110-x86_64-unknown-linux-gnu-install_only.tar.gz
+      DIAG: ${{ runner.temp }}/build-log.txt
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages (poppler = the pdftotext we bundle)
+        run: |
+          set -o pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils > >(tee -a "$DIAG")
+
+      - name: Portable Python (python-build-standalone — hosted-runner
+              CPython produces broken PyInstaller launchers)
+        run: |
+          set -o pipefail
+          {
+            curl -sfL -o /tmp/py.tar.gz \
+              "https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/${PBS_ASSET}"
+            sudo mkdir -p /opt/librarian-python
+            sudo tar -xzf /tmp/py.tar.gz -C /opt/librarian-python --strip-components=1
+            /opt/librarian-python/bin/python3 --version
+            /opt/librarian-python/bin/python3 -m venv "$GITHUB_WORKSPACE/.venv"
+            "$GITHUB_WORKSPACE/.venv/bin/pip" install -q --upgrade pip
+            "$GITHUB_WORKSPACE/.venv/bin/pip" install -q -e . pyinstaller
+            "$GITHUB_WORKSPACE/.venv/bin/python" -c "import PyInstaller; print('pyinstaller', PyInstaller.__version__)"
+          } 2>&1 | tee -a "$DIAG"
+
+      - name: Build AppImage + smoke-test the shipped artifact
+        run: |
+          set -o pipefail
+          { PY="$GITHUB_WORKSPACE/.venv/bin/python" SMOKE=1 bash packaging/build_appimage.sh; } 2>&1 | tee -a "$DIAG"
+          echo "ASSET=$(ls dist/*.AppImage | head -1)" >> "$GITHUB_ENV"
+
+      - name: Checksum + release notes for the asset list
+        run: |
+          ls -l dist/
+          cat dist/*.sha256
+
+      - name: Publish to GitHub Release
+        if: env.ASSET != ''
+        run: |
+          set -o pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          { python3 packaging/publish_release.py --tag "$TAG"; } 2>&1 | tee -a "$DIAG"
+
+      - name: Upload build log on failure (publicly readable, unlike job logs)
+        if: failure()
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          curl -sfL -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: text/plain" \
+            -X POST --data-binary "@$DIAG" \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$(
+              curl -sfL -H "Authorization: Bearer $GITHUB_TOKEN" \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+                | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])'
+            )/assets?name=build-log-$TAG.txt" || echo "release not created yet; log is in job output"

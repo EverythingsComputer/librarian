@@ -18,6 +18,19 @@ relevant exists, you see that it exists.
 
 ## Quick start
 
+**Easiest:** download `Librarian-<version>-x86_64.AppImage` from this repo's
+[Releases](../../releases) page. It is a single file — nothing to install:
+
+```bash
+chmod +x Librarian-*-x86_64.AppImage
+./Librarian-*-x86_64.AppImage      # opens the control page in your browser
+```
+
+(If double-clicking does nothing, install FUSE once: `sudo apt install libfuse2`,
+or run it from a terminal as above.)
+
+**From source** instead:
+
 ```bash
 ./install.sh     # asks for your password once, to install two system packages
 librarian ui     # opens the control page at http://127.0.0.1:8765
