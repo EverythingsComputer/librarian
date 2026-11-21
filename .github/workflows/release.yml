@@ -63,6 +63,8 @@ jobs:
 
       - name: Publish to GitHub Release
         if: env.ASSET != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -o pipefail
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
@@ -70,13 +72,21 @@ jobs:
 
       - name: Upload build log on failure (publicly readable, unlike job logs)
         if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          REL_ID=$(curl -sfL -H "Authorization: Bearer $GITHUB_TOKEN" "$API/releases/tags/$TAG" \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
+          if [ -z "$REL_ID" ]; then
+            REL_ID=$(curl -sfL -H "Authorization: Bearer $GITHUB_TOKEN" -X POST \
+              -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\"}" "$API/releases" \
+              | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+          fi
           curl -sfL -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Content-Type: text/plain" \
             -X POST --data-binary "@$DIAG" \
-            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$(
-              curl -sfL -H "Authorization: Bearer $GITHUB_TOKEN" \
-                "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
-                | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])'
-            )/assets?name=build-log-$TAG.txt" || echo "release not created yet; log is in job output"
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$REL_ID/assets?name=build-log-$TAG.txt" \
+            && echo "build log published as release asset" \
+            || echo "log upload failed; content follows:" && cat "$DIAG"

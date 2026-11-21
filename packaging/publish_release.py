@@ -87,4 +87,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as e:  # surface the reason as a step annotation, not just a traceback
+        print(f"::error::publish failed: {type(e).__name__}: {e}")
+        raise
