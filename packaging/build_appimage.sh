@@ -84,6 +84,7 @@ if [ "${SMOKE:-0}" = 1 ]; then
   T=$(mktemp -d)
   echo "== smoke: running the built AppImage in a clean dir"
   export LIBRARIAN_DATA=$T/data
+  export PYTHONUNBUFFERED=1
   AI="$OUT/$APPNAME-$VER-x86_64.AppImage"
   run() { timeout 180 "$AI" --appimage-extract-and-run "$@"; }
   mkdir -p "$T/docs"
@@ -95,6 +96,31 @@ if [ "${SMOKE:-0}" = 1 ]; then
   echo "-- find:"; run find "4200"
   echo "-- search:"; run search "roof repair approved" --mode lexical
   run status
+  # double-click path: bare `ui` must come up, and a second bare `ui` must
+  # slide to a free port instead of dying (v0.2.0 regression class).
+  # Port-agnostic so it also runs on machines where 8765 is already taken.
+  echo "-- ui (default port):"
+  wait_port() {  # $1=log  $2=max seconds; echoes first 127.0.0.1:PORT seen
+    local p
+    for _ in $(seq 1 "$2"); do
+      p=$(grep -oE '127\.0\.0\.1:[0-9]+' "$1" | head -1 | cut -d: -f2 || true)
+      [ -n "$p" ] && { echo "$p"; return 0; }
+      sleep 1
+    done
+    return 1
+  }
+  timeout 40 "$AI" --appimage-extract-and-run ui --no-browser > "$T/ui1.log" 2>&1 &
+  U1=$!
+  P1=$(wait_port "$T/ui1.log" 30) || { echo "SMOKE FAIL: first UI never came up"; cat "$T/ui1.log"; exit 1; }
+  curl -sf -o /dev/null "http://127.0.0.1:$P1/" && echo "   first UI answers on $P1"
+  timeout 40 "$AI" --appimage-extract-and-run ui --no-browser > "$T/ui2.log" 2>&1 &
+  U2=$!
+  P2=$(wait_port "$T/ui2.log" 30) || { echo "SMOKE FAIL: second UI never came up"; cat "$T/ui2.log"; exit 1; }
+  grep -q "busy" "$T/ui2.log" || { echo "SMOKE FAIL: second UI did not report sliding"; exit 1; }
+  [ "$P2" != "$P1" ] || { echo "SMOKE FAIL: second UI reused port $P1"; exit 1; }
+  curl -sf -o /dev/null "http://127.0.0.1:$P2/" && echo "   second UI slid to $P2 and answers"
+  kill $U1 $U2 2>/dev/null
+  wait $U1 $U2 2>/dev/null || true
   echo "== SMOKE OK"
   rm -rf "$T"
 fi

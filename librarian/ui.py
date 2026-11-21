@@ -7,6 +7,7 @@ index is kept so re-enabling needs no re-index).
 """
 from __future__ import annotations
 
+import errno
 import json
 import threading
 import time
@@ -430,11 +431,36 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": f"{type(e).__name__}: {e}"}, 400)
 
 
-def serve(cfg_dir: Path, port: int = DEFAULT_PORT, open_browser: bool = True):
-    Handler.cfg_dir = Path(cfg_dir)
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+def _bind(cfg_dir: Path, port: int, explicit: bool):
+    """Bind the loopback server; on a busy DEFAULT port (double-click/AppRun
+    launch) slide up to the next free one instead of dying. An explicitly
+    requested port fails with a plain-language error instead of a traceback."""
+    Handler.cfg_dir = cfg_dir
+    try:
+        return ThreadingHTTPServer(("127.0.0.1", port), Handler), port
+    except OSError as e:
+        if e.errno != errno.EADDRINUSE or explicit:
+            raise SystemExit(
+                f"port {port} is already in use.\n"
+                f"  - If the Librarian page is already running here, just open "
+                f"http://127.0.0.1:{port}/ and stop this command (Ctrl+C).\n"
+                f"  - Otherwise use another port:  librarian ui --port 8790") from None
+        for cand in range(port + 1, port + 26):
+            try:
+                srv = ThreadingHTTPServer(("127.0.0.1", cand), Handler)
+                print(f"(port {port} is busy — using {cand} instead)", flush=True)
+                return srv, cand
+            except OSError:
+                continue
+        raise SystemExit(
+            f"ports {port}-{port + 25} are all in use; pick one: librarian ui --port N") from None
+
+
+def serve(cfg_dir: Path, port: int = DEFAULT_PORT, open_browser: bool = True,
+          explicit: bool = False):
+    srv, port = _bind(Path(cfg_dir), port, explicit)
     url = f"http://127.0.0.1:{port}/"
-    print(f"Librarian UI: {url}  (Ctrl+C to stop)")
+    print(f"Librarian UI: {url}  (Ctrl+C to stop)", flush=True)
     if open_browser:
         threading.Timer(0.7, lambda: webbrowser.open(url)).start()
     try:

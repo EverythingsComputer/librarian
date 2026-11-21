@@ -138,9 +138,12 @@ def cmd_toggle(args, enable: bool):
 
 
 def cmd_ui(args):
-    from .ui import serve
+    from .ui import DEFAULT_PORT, serve
     cfg = _cfg(args)
-    serve(cfg.data_dir, port=args.port, open_browser=not args.no_browser)
+    # explicit = the user typed --port themselves (even if 8765); a bare
+    # launch of the default port is allowed to slide if it's busy
+    serve(cfg.data_dir, port=args.port or DEFAULT_PORT,
+          open_browser=not args.no_browser, explicit=args.port is not None)
 
 
 def cmd_mcp_serve(args):
@@ -350,7 +353,8 @@ def main(argv=None):
     p.add_argument("name")
     p.set_defaults(fn=lambda a: cmd_toggle(a, False))
     p = sub.add_parser("ui", parents=[common], help="local web page for maintenance + search")
-    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--port", type=int, default=None,
+                   help="default: 8765; if busy the default launch uses the next free port")
     p.add_argument("--no-browser", action="store_true")
     p.set_defaults(fn=cmd_ui)
     p = sub.add_parser("mcp-serve", parents=[common],
