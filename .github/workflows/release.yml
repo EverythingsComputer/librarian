@@ -22,7 +22,9 @@ jobs:
     env:
       PBS_TAG: 20261110
       PBS_ASSET: cpython-3.12.16+20261110-x86_64-unknown-linux-gnu-install_only.tar.gz
-      DIAG: ${{ runner.temp }}/build-log.txt
+      # runner context is not available in job-level env; fixed path on the
+      # ephemeral runner is equivalent
+      DIAG: /tmp/librarian-build-log.txt
     steps:
       - uses: actions/checkout@v4
 
