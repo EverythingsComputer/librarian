@@ -94,6 +94,12 @@ private network): start the server once, then clients use its address:
 librarian mcp-serve --transport http --host <this-machine-ip> --port 8770
 ```
 
+> **AppImage users:** if `librarian` is not on your PATH (the AppImage never
+> installs anything), the literal command above will say `command not found`.
+> Open the UI's "Connect an agent" section instead: its *Start command* box
+> prints the exact command that works for that machine — copy and paste it
+> as-is (v0.2.4+).
+
 Clients connect to `http://<this-machine-ip>:8770/mcp` and authenticate with
 the access token — either as an `Authorization: Bearer <token>` header or, for
 clients that accept only a plain URL, appended as `?token=<token>`. The token

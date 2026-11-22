@@ -153,10 +153,47 @@ def api_connection(cfg: Config) -> dict:
         "token": tok,               # UI is loopback-only; the local user owns this secret
         "mcp_path": "/mcp",
         "connect_url": f"{url_base}:{port}/mcp" + (f"?token={tok}" if tok else ""),
-        "serve_cmd": (f"librarian mcp-serve --transport http "
+        "serve_cmd": (f"{_serve_invocation()} mcp-serve --transport http "
                       f"--host {ts_ip or '0.0.0.0'} --port {port}"
                       + ("" if tok else " --token 'pick-a-long-random-secret'")),
     }
+
+
+def _serve_invocation() -> str:
+    """The invocation that ACTUALLY starts mcp-serve in a fresh shell on this
+    machine, whatever shape librarian was launched in (v0.2.4). A literal
+    `librarian` breaks for AppImage users (nothing installs on PATH) and for
+    venv installs whose bin dir isn't exported. Resolution order:
+      1. a `librarian` console script already on PATH,
+      2. one sitting next to our own interpreter (venv: .venv/bin/librarian),
+      3. no console script at all (AppImage / source run): module form,
+         re-exporting the PYTHONPATH (package dir) and LD_LIBRARY_PATH
+         (bundled loader libs) this live process runs with, so the pasted
+         command reproduces our own environment in the user's shell.
+    Everything is shlex.quoted; paths inside an AppImage mount stay valid
+    because the UI process (which the user copies from) holds the mount open.
+    """
+    import os
+    import shlex
+    import shutil
+    import sys
+    from pathlib import Path as _P
+    w = shutil.which("librarian")
+    if w:
+        return shlex.quote(w)
+    try:
+        side = _P(sys.executable).resolve().parent / "librarian"
+        if side.exists() and os.access(side, os.X_OK):
+            return shlex.quote(str(side))
+    except OSError:
+        pass
+    from . import __file__ as _init
+    pkg_root = str(_P(_init).resolve().parent.parent)  # dir containing the package
+    env = f"PYTHONPATH={shlex.quote(pkg_root)} "
+    ldlp = os.environ.get("LD_LIBRARY_PATH", "")
+    if ldlp:
+        env += f"LD_LIBRARY_PATH={shlex.quote(ldlp)} "
+    return f"{env}{shlex.quote(sys.executable)} -m librarian.cli"
 
 
 def api_state(cfg: Config) -> dict:
