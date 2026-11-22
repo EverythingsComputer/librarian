@@ -117,9 +117,8 @@ d.cell(text="The roof repair was approved for 4200 dollars.")
 d.output("/tmp/roof-smoke.pdf")
 PYX
   cp /tmp/roof-smoke.pdf "$T/docs/roof.pdf"
-  # an IMAGE-ONLY PDF (render roof.pdf to a picture, re-wrap as PDF):
+  # an IMAGE-ONLY PDF: render clean text to a picture, re-wrap as PDF —
   # only a working OCR pipeline can make this searchable
-  pdftoppm -r 300 -png /tmp/roof-smoke.pdf "$T/scanpage"  # 300dpi: clean OCR target
   "$PY" - <<'PYX'
 from fpdf import FPDF
 d = FPDF(); d.add_page(); d.set_font("Helvetica", size=24)
@@ -127,12 +126,14 @@ d.cell(text="Zirconium gate 9041 calibration was approved by inspector.")
 d.output("/tmp/scan-src.pdf")
 PYX
   pdftoppm -r 300 -png /tmp/scan-src.pdf "$T/scanpage"
-  "$PY" - <<'PYX'
+  T="$T" "$PY" - <<'PYX'
+import os, glob
 from fpdf import FPDF
-import glob
+T = os.environ["T"]
+png = sorted(glob.glob(os.path.join(T, "scanpage*.png")))[0]
 d = FPDF(); d.add_page()
-d.image(sorted(glob.glob("$T/scanpage*.png"))[0], x=10, y=10, w=190)
-d.output("$T/docs/scan-only.pdf")
+d.image(png, x=10, y=10, w=190)
+d.output(os.path.join(T, "docs", "scan-only.pdf"))
 PYX
   run init
   run add-folder "$T/docs"
