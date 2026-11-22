@@ -90,6 +90,11 @@ def _excl() -> list[str] | None:
     return Config.load(cfg().data_dir).disabled_roots or None
 
 
+import threading
+
+_build_gate = threading.Lock()
+_building = {"on": False}
+
 INSTRUCTIONS_NOTE = "see server instructions"
 
 
@@ -161,12 +166,27 @@ def related(doc_id: int, k: int = 8) -> str:
 @mcp.tool()
 def update_index() -> str:
     """Scan library roots and index new/changed files (incremental, safe to call).
-    Use when the user says they just added or changed files."""
-    import subprocess, sys
-    r = subprocess.run([sys.executable, "-m", "librarian.cli", "build"],
-                       capture_output=True, text=True, timeout=3600)
-    tail = (r.stdout or "").strip().splitlines()[-4:]
-    return "\n".join(tail) if r.returncode == 0 else f"update failed: {r.stderr[-400:]}"
+    Use when the user says they just added or changed files. Files that failed
+    earlier because an extraction tool was missing are retried automatically."""
+    # in-process (v0.2.5): the old child launch `sys.executable -m librarian.cli`
+    # never worked inside the AppImage — the executable there is a frozen
+    # binary with no -m flag, so this tool always returned "update failed".
+    with _build_gate:
+        if _building["on"]:
+            return "a sync is already running; try again in a minute"
+        _building["on"] = True
+    try:
+        from .ingest import build_or_update
+        rep: dict = {}
+        build_or_update(cfg(), report=rep)
+        return ("added=%s changed=%s removed=%s docs=%s chunks=%s seconds=%s textless=%s"
+                % tuple(rep.get(k) for k in ("added", "changed", "removed",
+                                             "docs", "chunks", "seconds", "textless")))
+    except Exception as e:
+        return f"update failed: {type(e).__name__}: {e}"
+    finally:
+        with _build_gate:
+            _building["on"] = False
 
 
 if __name__ == "__main__":

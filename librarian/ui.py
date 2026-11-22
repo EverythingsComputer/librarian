@@ -51,10 +51,19 @@ def human_summary(cfg: Config, report: dict) -> str:
         ph = ",".join("?" * len(excl))
         hidden = db.execute(
             f"SELECT COUNT(*) c FROM docs WHERE root IN ({ph}) AND dup_of IS NULL", excl).fetchone()["c"]
-    dups = db.execute("SELECT COUNT(*) c FROM docs WHERE dup_of IS NOT NULL").fetchone()["c"]
+    # "searchable" must mean it can actually be found: count only docs with
+    # text behind them (v0.2.5 — stub-heavy indexes used to advertise every
+    # failed file as searchable, which is how Optiplex shipped "303 of 303")
+    cond = "d.dup_of IS NULL AND EXISTS(SELECT 1 FROM chunks c WHERE c.doc_id=d.id)"
+    args: list = []
+    if excl:
+        cond += f" AND d.root NOT IN ({','.join('?' * len(excl))})"
+        args = list(excl)
+    searchable = db.execute(f"SELECT COUNT(*) c FROM docs d WHERE {cond}", args).fetchone()["c"]
+    textless = db.execute(
+        "SELECT COUNT(*) c FROM docs WHERE kind='empty' AND dup_of IS NULL").fetchone()["c"]
     db.close()
     total = report.get("docs", 0)
-    searchable = max(0, total - dups - hidden)
     parts = []
     for key, word in (("added", "new"), ("changed", "changed"), ("removed", "removed")):
         n = report.get(key, 0)
@@ -62,8 +71,15 @@ def human_summary(cfg: Config, report: dict) -> str:
             parts.append(f"{n} {word}")
     what = ", ".join(parts) if parts else "nothing new"
     off = f" — {len(off_names(cfg))} folder(s) switched off, {hidden} docs hidden" if excl else ""
+    warn = ""
+    if textless and searchable == 0:
+        warn = (f" WARNING: none of the {total} files produced any text — the PDF"
+                f" extractor cannot run here (install poppler-utils, or use the"
+                f" AppImage v0.2.5+ which bundles and uses its own).")
+    elif textless:
+        warn = f" Note: {textless} file(s) still have no searchable text (scanned PDFs?)."
     return (f"Checked: {what}. Library: {total} documents, {searchable} searchable{off}. "
-            f"Took {report.get('seconds', 0)}s.")
+            f"Took {report.get('seconds', 0)}s.{warn}")
 
 
 def off_names(cfg: Config) -> list[str]:
@@ -74,9 +90,13 @@ def off_names(cfg: Config) -> list[str]:
 
 def _sh(cmd: list[str], timeout: float = 2.0) -> str:
     import subprocess
+    # host helpers (tailscale) must not inherit the bundle's loader env —
+    # same leak as the v0.2.1 browser-open bug (v0.2.5)
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("LD_LIBRARY_PATH", "LD_PRELOAD")}
     try:
         return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout).stdout.strip()
+                              timeout=timeout, env=env).stdout.strip()
     except Exception:
         return ""
 
@@ -213,11 +233,16 @@ def api_state(cfg: Config) -> dict:
     searchable_roots = [r.name for r in cfg.roots if r.enabled]
     if searchable_roots:
         ph = ",".join("?" * len(searchable_roots))
+        # searchable = has real text behind it (v0.2.5); empty stubs are counted
+        # separately and shown as a warning instead of being advertised
         searchable = db.execute(
-            f"SELECT COUNT(*) n FROM docs WHERE dup_of IS NULL AND root IN ({ph})",
+            f"SELECT COUNT(*) n FROM docs d WHERE d.dup_of IS NULL AND d.root IN ({ph})"
+            " AND EXISTS(SELECT 1 FROM chunks c WHERE c.doc_id=d.id)",
             searchable_roots).fetchone()["n"]
     else:
         searchable = 0
+    textless = db.execute(
+        "SELECT COUNT(*) n FROM docs WHERE kind='empty' AND dup_of IS NULL").fetchone()["n"]
     known = {r.name for r in cfg.roots}
     for r in cfg.roots:
         c = counts.get(r.name, {"n": 0, "d": 0})
@@ -230,8 +255,11 @@ def api_state(cfg: Config) -> dict:
                                      "enabled": False, "docs": (c["n"] or 0) - (c["d"] or 0),
                                      "missing": True})
     db.close()
+    from .extract import tool_path
     out.update(last_sync=time.strftime("%Y-%m-%d %H:%M", time.localtime(float(row["v"] or 0))) if row else "",
                total_docs=total, duplicates=dups, searchable=searchable,
+               textless=textless,
+               tools={n: bool(tool_path(n)) for n in ("pdftotext", "pdfinfo")},
                db_mb=round(cfg.db_path.stat().st_size / 1e6, 1))
     return out
 
@@ -247,13 +275,13 @@ def api_search(cfg: Config, q: str, k: int = 10) -> list[dict]:
              "kind": h["kind"], "score": round(h["score"], 4)} for h in hits]
 
 
-def api_sync(cfg: Config) -> dict:
+def api_sync(cfg: Config, retry_empty: bool = False) -> dict:
     if not _sync_lock.acquire(blocking=False):
         return {"busy": True, "message": "A sync is already running."}
     try:
         from .ingest import build_or_update
         report: dict = {}
-        build_or_update(cfg, report=report)
+        build_or_update(cfg, report=report, retry_empty=retry_empty)
         return {"busy": False, "report": report, "summary": human_summary(cfg, report)}
     finally:
         _sync_lock.release()
@@ -310,6 +338,7 @@ input:checked+.sl{background:var(--ok)}input:checked+.sl:before{transform:transl
 #msg{font-size:13px;color:var(--ok);margin-left:10px;white-space:pre-line}
 .err{color:#e5645f!important}.del{background:none;color:#e5645f;padding:4px 8px;font-size:13px}
 .miss{color:#e5645f;font-size:12px}
+.warn{display:none;margin:10px 0;padding:10px 12px;border:1px solid #7a5b1e;border-radius:8px;background:#2a2213;color:#e8c46f;font-size:13.5px}
 .crow{display:flex;align-items:center;gap:8px;margin:6px 0}
 .crow .cl{color:var(--mut);font-size:12px;min-width:170px}
 .crow code{flex:1;background:#0d1013;border:1px solid var(--line);border-radius:6px;
@@ -318,6 +347,7 @@ input:checked+.sl{background:var(--ok)}input:checked+.sl:before{transform:transl
 </style></head><body><main>
 <h1><b>Librarian</b> — your document library</h1>
 <div class="stats" id="stats">loading…</div>
+<div class="warn" id="warn"></div>
 
 <section><h2>Search your library</h2>
 <input type="text" id="q" placeholder="Type a question or words, press Enter">
@@ -345,6 +375,12 @@ async function refresh(){
  $('stats').textContent=s.indexed?
   `${s.searchable} of ${s.total_docs} documents searchable · last checked ${s.last_sync} · index ${s.db_mb} MB`:
   'not indexed yet — add a folder and press “Check for new files”';
+ const w=$('warn');
+ if(s.indexed&&s.textless>0){w.style.display='block';
+  w.innerHTML=`${s.textless} file(s) have no searchable text. `
+   +(s.tools&&!s.tools.pdftotext?`<b>No PDF extractor is available on this machine</b> — install poppler-utils or run the AppImage v0.2.5+ (it bundles its own). `:'')
+   +`<button class="sec" onclick="retryEmpty()">Retry textless files</button>`;}
+ else w.style.display='none';
  $('libs').innerHTML=(s.libraries||[]).map(l=>`<div class="lib">
   <label class="sw"><input type="checkbox" ${l.enabled?'checked':''} onchange="toggle('${esc(l.name)}',this.checked)"><span class="sl"></span></label>
   <div><div class="nm">${esc(l.name)} ${l.missing?'<span class="miss">(folder missing!)</span>':''}</div>
@@ -354,6 +390,10 @@ async function refresh(){
 }
 async function sync(){ $('sync').disabled=true;$('msg').className='';$('msg').textContent='checking…';
  try{const d=await j('/api/sync',{});$('msg').textContent=d.summary||(d.busy?d.message:'done')}
+ catch(e){$('msg').className='err';$('msg').textContent=''+e}
+ $('sync').disabled=false;refresh()}
+async function retryEmpty(){ $('sync').disabled=true;$('msg').textContent='retrying files with no text…';
+ try{const d=await j('/api/sync',{retry:true});$('msg').textContent=d.summary||'done'}
  catch(e){$('msg').className='err';$('msg').textContent=''+e}
  $('sync').disabled=false;refresh()}
 async function toggle(n,on){try{await j('/api/toggle',{name:n,enabled:on});refresh()}catch(e){alert(e)}}
@@ -458,7 +498,7 @@ class Handler(BaseHTTPRequestHandler):
         cfg = Config.load(self.cfg_dir)
         try:
             if u.path == "/api/sync":
-                self._json(api_sync(cfg))
+                self._json(api_sync(cfg, retry_empty=bool(body.get("retry"))))
             elif u.path == "/api/add":
                 self._json(api_add(cfg, body.get("path", ""), body.get("name")))
             elif u.path == "/api/toggle":

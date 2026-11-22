@@ -1,6 +1,6 @@
 [project]
 name = "librarian"
-version = "0.2.4"
+version = "0.2.5"
 description = "Agent-first document library search: hybrid BM25+vector over PDF/PPTX/DOCX/TXT/MSG, exposed as CLI + MCP server"
 requires-python = ">=3.10"
 license = {text = "MIT"}

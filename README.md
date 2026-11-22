@@ -54,7 +54,8 @@ librarian search "what did we decide about the roof repair"
 ## Requirements
 
 - Linux (written and tested on Ubuntu 24.04+, x86_64), Python 3.10+
-- `poppler-utils` (the installer takes care of it)
+- `poppler-utils` for source installs — the **AppImage needs none of this**;
+  it ships and uses its own PDF extractor (v0.2.5+)
 - About 1.5 GB free disk the first time (a small search model downloads once)
 - Older 4-core mini PCs and laptops are enough; no graphics card needed.
   Indexing uses about 1–1.5 GB of memory; searching uses much less.
@@ -78,6 +79,12 @@ Daily upkeep is one command, or one button on the web page:
 ```bash
 librarian sync     # notice files you added or deleted; index the new ones
 ```
+
+Honesty guarantee (v0.2.5): "searchable" counts only files that actually
+produced text. If anything failed to extract, the page says how many and why,
+with a **Retry textless files** button; `sync --retry-empty` is the CLI form.
+Upgrading the app automatically re-extracts files that failed because an
+extraction tool was missing — no manual rebuild.
 
 ## Connecting an AI assistant (optional)
 

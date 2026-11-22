@@ -57,8 +57,23 @@ def extract_doc(path: Path, cfg: Config) -> X.Extracted:
     return X.Extracted(note=f"unsupported extension .{ext}")
 
 
+# Notes that prove a file failed for TOOL reasons (missing/broken extractor),
+# not because the document itself lacks text. v0.2.5 retries these
+# automatically once the tool is available, so upgrading the app repairs an
+# index that was built with a broken one. Real scans carry the note
+# "no text layer (N pages) — scanned?" and are never auto-retried.
+TOOL_FAILURE_NOTES = ("pdftotext not installed", "pdftotext not found",
+                      "pdftotext failed", "no text extracted",
+                      "extraction error")
+
+
+def is_tool_failure(note: "str | None") -> bool:
+    n = note or ""
+    return any(m in n for m in TOOL_FAILURE_NOTES)
+
+
 def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = False, limit: int = 0,
-                    report: dict | None = None):
+                    report: dict | None = None, retry_empty: bool = False):
     """Scan all configured roots and index new/changed files. When `report` is
     passed it receives machine-readable counts (added/changed/removed/seconds/
     docs/chunks) so callers like `sync` and the web UI can summarize."""
@@ -96,6 +111,30 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
             plans.append(("new", p))
         elif force or abs(st.st_mtime - row["mtime"]) > 1 or st.st_size != row["size"]:
             plans.append(("update", p))
+
+    # self-heal (v0.2.5): re-extract empty stubs whose stored note says the
+    # EXTRACTOR failed, now that a working one exists. Converges in one run:
+    # success removes the stub; a real scan gets the "no text layer" note,
+    # which is not in TOOL_FAILURE_NOTES.
+    planned = {str(p) for _, p in plans}
+    from .extract import has_poppler as _pop
+    if retry_empty:
+        for r in existing.values():
+            sp = str(r["path"])
+            if (r["kind"] == "empty" and (r["ext"] or "") == "pdf"
+                    and sp not in planned and sp in seen and Path(sp).is_file()):
+                plans.append(("update", Path(sp)))
+                planned.add(sp)
+    elif _pop():
+        for r in existing.values():
+            sp = str(r["path"])
+            if (r["kind"] != "empty" or sp in planned or sp not in seen
+                    or (r["ext"] or "") != "pdf"
+                    or not is_tool_failure(r["note"] or "")):
+                continue
+            if Path(sp).is_file():
+                plans.append(("update", Path(sp)))
+                planned.add(sp)
 
     for sp in existing:
         if sp not in seen:
@@ -156,6 +195,9 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
             seconds=round(elapsed, 1),
             docs=n_docs,
             chunks=n_chunks,
+            textless=db.execute(
+                "SELECT COUNT(*) c FROM docs WHERE kind='empty' AND dup_of IS NULL"
+            ).fetchone()["c"],
         )
     return db
 
@@ -329,6 +371,7 @@ def _vacuum_if_needed(db, cfg):
 
 def status(cfg: Config) -> dict:
     import json
+    from .extract import tool_path
     if not cfg.db_path.exists():
         return {"indexed": False, "db": str(cfg.db_path)}
     db = connect(cfg.db_path, read_only=True)
@@ -343,6 +386,9 @@ def status(cfg: Config) -> dict:
         "db_mb": round(cfg.db_path.stat().st_size / 1e6, 1),
         "docs": db.execute("SELECT COUNT(*) c FROM docs").fetchone()["c"],
         "with_text": db.execute("SELECT COUNT(*) c FROM docs WHERE chars>0").fetchone()["c"],
+        "textless": db.execute(
+            "SELECT COUNT(*) c FROM docs WHERE kind='empty' AND dup_of IS NULL").fetchone()["c"],
+        "tools": {n: tool_path(n) for n in ("pdftotext", "pdfinfo", "ocrmypdf")},
         "duplicates": db.execute("SELECT COUNT(*) c FROM docs WHERE dup_of IS NOT NULL").fetchone()["c"],
         "chunks": db.execute("SELECT COUNT(*) c FROM chunks").fetchone()["c"],
         "dims": int(meta_val("dims", 0)),

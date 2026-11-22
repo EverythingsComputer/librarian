@@ -46,7 +46,7 @@ jobs:
             /opt/librarian-python/bin/python3 --version
             /opt/librarian-python/bin/python3 -m venv "$GITHUB_WORKSPACE/.venv"
             "$GITHUB_WORKSPACE/.venv/bin/pip" install -q --upgrade pip
-            "$GITHUB_WORKSPACE/.venv/bin/pip" install -q -e . pyinstaller
+            "$GITHUB_WORKSPACE/.venv/bin/pip" install -q -e . pyinstaller fpdf2
             "$GITHUB_WORKSPACE/.venv/bin/python" -c "import PyInstaller; print('pyinstaller', PyInstaller.__version__)"
           } 2>&1 | tee -a "$DIAG"
 

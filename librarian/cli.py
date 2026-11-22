@@ -61,7 +61,7 @@ def cmd_sync(args):
     cfg = _cfg(args)
     from .ingest import build_or_update
     report: dict = {}
-    build_or_update(cfg, report=report)
+    build_or_update(cfg, report=report, retry_empty=getattr(args, "retry_empty", False))
     if args.json:
         _j(report)
         return
@@ -160,7 +160,8 @@ def cmd_mcp_serve(args):
 def cmd_build(args):
     cfg = _cfg(args)
     from .ingest import build_or_update
-    build_or_update(cfg, force=args.force, use_llm_summaries=args.llm, limit=args.limit)
+    build_or_update(cfg, force=args.force, use_llm_summaries=args.llm, limit=args.limit,
+                    retry_empty=getattr(args, "retry_empty", False))
 
 
 def cmd_status(args):
@@ -287,11 +288,15 @@ def main(argv=None):
     p = sub.add_parser("build", parents=[common])
     p.add_argument("--llm", action="store_true", help="generate LLM doc summaries")
     p.add_argument("--force", action="store_true", help="re-extract everything")
+    p.add_argument("--retry-empty", action="store_true",
+                   help="also re-extract every empty PDF, including true scans")
     p.add_argument("--limit", type=int, default=0, help="debug: cap files")
     p.set_defaults(fn=cmd_build)
     p = sub.add_parser("update", parents=[common])
     p.add_argument("--llm", action="store_true")
-    p.set_defaults(fn=lambda a: cmd_build(argparse.Namespace(llm=a.llm, force=False, limit=0, data=a.data)))
+    p.add_argument("--retry-empty", action="store_true")
+    p.set_defaults(fn=lambda a: cmd_build(argparse.Namespace(
+        llm=a.llm, force=False, limit=0, data=a.data, retry_empty=a.retry_empty)))
     p = sub.add_parser("status", parents=[common]); p.set_defaults(fn=cmd_status)
     p = sub.add_parser("ls", parents=[common]); p.add_argument("--folder"); p.add_argument("--limit", type=int, default=400); p.set_defaults(fn=cmd_ls)
     p = sub.add_parser("card", parents=[common]); p.add_argument("doc_id", type=int); p.set_defaults(fn=cmd_card)
@@ -333,6 +338,8 @@ def main(argv=None):
     p = sub.add_parser("sync", parents=[common],
                        help="check for new/changed/removed files and update the index")
     p.add_argument("--json", action="store_true", help="machine-readable report instead of prose")
+    p.add_argument("--retry-empty", action="store_true",
+                   help="also re-extract every empty PDF, including true scans")
     p.set_defaults(fn=cmd_sync)
     p = sub.add_parser("folders", parents=[common], help="list library folders and on/off state")
     p.add_argument("--json", action="store_true")

@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,7 +41,41 @@ def normalize_text(s: str) -> str:
 
 
 def has_poppler() -> bool:
-    return shutil.which("pdftotext") is not None
+    return tool_path("pdftotext") is not None
+
+
+def _bundle_bin():
+    """The app's own bin dir when it runs as a bundle (AppImage/PyInstaller)."""
+    if getattr(sys, "frozen", False) or os.environ.get("APPIMAGE"):
+        return Path(sys.executable).resolve().parent
+    return None
+
+
+def tool_path(name: str):
+    """Resolve an external helper (pdftotext, pdfinfo, ocrmypdf). Inside a
+    bundle the launcher puts the bundled bin dir first on PATH (v0.2.5), so
+    bundled poppler wins over a host one the bundled loader env would kill."""
+    return shutil.which(name)
+
+
+def tool_env(path=None) -> dict:
+    """Child environment for external tools. A host binary must NEVER inherit
+    the bundle's LD_LIBRARY_PATH/LD_PRELOAD: the bundled libstdc++ and poppler
+    deps fail against the host glibc, the tool dies at load, and stdout comes
+    back empty — that is how every PDF on the Optiplex indexed itself as a
+    silent empty stub (v0.2.5). Tools from our own bundle keep the env."""
+    env = os.environ.copy()
+    bd = _bundle_bin()
+    if bd is None or path is None:
+        return env
+    try:
+        Path(path).resolve().relative_to(bd)
+        return env
+    except ValueError:
+        pass
+    env.pop("LD_LIBRARY_PATH", None)
+    env.pop("LD_PRELOAD", None)
+    return env
 
 
 # ---------------- PDF ----------------
@@ -55,13 +90,21 @@ def extract_pdf(path: Path, ocr: bool = False, ocr_lang: str = "eng") -> Extract
         ex.year = m.group(1)
         ex.doc_date = cd[:10]
     if not has_poppler():
-        ex.note = "pdftotext not installed (apt install poppler-utils)"
+        ex.note = ("pdftotext not found — install poppler-utils "
+                   "(the AppImage bundles its own and uses it automatically)")
         return ex
+    pdf_bin = tool_path("pdftotext")
     raw = subprocess.run(
-        ["pdftotext", "-enc", "UTF-8", str(path), "-"],
+        [pdf_bin, "-enc", "UTF-8", str(path), "-"],
         capture_output=True, text=True, errors="replace", timeout=300,
+        env=tool_env(pdf_bin),
     )
     text = raw.stdout or ""
+    if raw.returncode != 0 and not text.strip():
+        # never fail silently: say exactly what the tool said (v0.2.5)
+        ex.note = (f"pdftotext failed (exit {raw.returncode}): "
+                   f"{(raw.stderr or '').strip()[:200]}")
+        return ex
     pages = [normalize_text(p) for p in text.split("\x0c")]
     pages = [p for p in pages if p]
     total_chars = sum(len(p) for p in pages)
@@ -83,13 +126,16 @@ def _ocr_pdf(path: Path, meta: dict) -> Extracted:
     ex.note = "OCR'd at index time"
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "ocr.pdf"
+        ocr_bin = tool_path("ocrmypdf")
+        pdf_bin2 = tool_path("pdftotext")
         subprocess.run(
-            ["ocrmypdf", "--skip-text", "--quiet", str(path), str(out)],
-            capture_output=True, text=True, timeout=1800,
+            [ocr_bin, "--skip-text", "--quiet", str(path), str(out)],
+            capture_output=True, text=True, timeout=1800, env=tool_env(ocr_bin),
         )
         text = subprocess.run(
-            ["pdftotext", "-enc", "UTF-8", str(out), "-"],
+            [pdf_bin2, "-enc", "UTF-8", str(out), "-"],
             capture_output=True, text=True, errors="replace", timeout=300,
+            env=tool_env(pdf_bin2),
         ).stdout
     for i, p in enumerate([normalize_text(p) for p in text.split("\x0c") if normalize_text(p)], 1):
         ex.units.append((f"p.{i}", p))
@@ -97,10 +143,12 @@ def _ocr_pdf(path: Path, meta: dict) -> Extracted:
 
 
 def _pdfinfo(path: Path) -> dict:
-    if not shutil.which("pdfinfo"):
+    info_bin = tool_path("pdfinfo")
+    if not info_bin:
         return {}
     try:
-        out = subprocess.run(["pdfinfo", str(path)], capture_output=True, text=True, timeout=30).stdout
+        out = subprocess.run([info_bin, str(path)], capture_output=True,
+                             text=True, timeout=30, env=tool_env(info_bin)).stdout
     except Exception:
         return {}
     info = {}

@@ -26,15 +26,19 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$OUT"
 # 2. AppDir layout: everything under usr/, AppRun + desktop + icon at root
 cp -a "$BUILD/pyi/librarian/." "$APPDIR/usr/bin/"
 
-# 3. bundle pdftotext + its non-glibc shared-library closure
-PDT=$(command -v pdftotext)
-cp "$PDT" "$APPDIR/usr/bin/pdftotext"
+# 3. bundle pdftotext + pdfinfo + their non-glibc shared-library closure
+# (pdfinfo was never bundled at all: pages/year silently stayed null)
 mkdir -p "$BUILD/pdt-libs"
+for BIN in pdftotext pdfinfo; do
+PDT=$(command -v "$BIN")
+[ -n "$PDT" ] || { echo "!! build host lacks $BIN" >&2; exit 1; }
+cp "$PDT" "$APPDIR/usr/bin/$BIN"
 ldd "$PDT" | awk '{ if ($3 ~ /^\//) print $3 }' | while read -r so; do
   case "$so" in
     *libc.so*|*libm.so*|*libdl.so*|*libpthread*|*librt.so*|*ld-linux*|*libnss*|*libresolv*|*libstdc++.so*) ;; # leave to host
     *) cp -Ln "$so" "$APPDIR/usr/lib/" 2>/dev/null || true ;;
   esac
+done
 done
 # libstdc++ shipped: older hosts may lack a new enough one; poppler/fastembed both want it
 STD=$(ldconfig -p | awk '/libstdc\+\+\.so\.6 /{print $NF; exit}') || true
@@ -46,6 +50,11 @@ cat > "$APPDIR/AppRun" <<'EOF'
 #!/usr/bin/env bash
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export LD_LIBRARY_PATH="$HERE/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# bundled pdftotext/pdfinfo must be findable on PATH (v0.2.5): before this,
+# the bundle shipped them but the code could never see them, while the SAME
+# LD_LIBRARY_PATH killed any HOST poppler the code did find — every PDF in
+# an AppImage-built index silently contained no text.
+export PATH="$HERE/usr/bin:$PATH"
 cd "$HERE/usr/bin"
 ./librarian init >/dev/null 2>&1 || true
 if [ "$#" -eq 0 ]; then exec ./librarian ui; else exec ./librarian "$@"; fi
@@ -90,10 +99,21 @@ if [ "${SMOKE:-0}" = 1 ]; then
   mkdir -p "$T/docs"
   printf 'The roof repair was approved for 4200 dollars.\n' > "$T/docs/roof.txt"
   printf 'Gardening notes for the spring season.\n' > "$T/docs/garden.txt"
+  # a REAL PDF, asserted — a txt-only smoke let the pdftotext breakage ship
+  "$PY" - <<'PYX'
+from fpdf import FPDF
+d = FPDF(); d.add_page(); d.set_font("Helvetica", size=12)
+d.cell(text="The roof repair was approved for 4200 dollars.")
+d.output("/tmp/roof-smoke.pdf")
+PYX
+  cp /tmp/roof-smoke.pdf "$T/docs/roof.pdf"
   run init
   run add-folder "$T/docs"
   run sync
   echo "-- find:"; run find "4200"
+  run find "4200" | grep -q roof.pdf \
+    && echo "   PDF text extraction inside the AppImage works" \
+    || { echo "SMOKE FAIL: bundled pdftotext did not extract roof.pdf — see status/tools"; exit 1; }
   echo "-- search:"; run search "roof repair approved" --mode lexical
   run status
   # double-click path: bare `ui` must come up, and a second bare `ui` must
