@@ -109,12 +109,17 @@ def extract_pdf(path: Path, ocr: bool = False, ocr_lang: str = "eng") -> Extract
     pages = [p for p in pages if p]
     total_chars = sum(len(p) for p in pages)
     npages_meta = int(meta.get("Pages", "0") or 0)
-    if total_chars < 200 and npages_meta > 0:
-        # likely scanned
-        if ocr and shutil.which("ocrmypdf"):
+    if total_chars == 0 and npages_meta > 0:
+        # genuinely no characters came out: scanned (or an image-only PDF)
+        if ocr and tool_path("ocrmypdf"):
             return _ocr_pdf(path, meta)
         ex.note = f"no text layer ({npages_meta} pages) — scanned? enable [index] ocr=true or OCR the file"
         return ex
+    if total_chars < 200 and npages_meta > 3:
+        # sparse but REAL text: index it, warn softly (v0.2.6: the old
+        # <200-equals-scanned rule threw away extracted text entirely)
+        ex.note = (f"very little text for {npages_meta} pages "
+                   f"({total_chars} chars) — mostly images?")
     for i, p in enumerate(pages, 1):
         ex.units.append((f"p.{i}", p))
     return ex.finalize()

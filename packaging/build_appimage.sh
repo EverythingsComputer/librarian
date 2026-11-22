@@ -111,9 +111,13 @@ PYX
   run add-folder "$T/docs"
   run sync
   echo "-- find:"; run find "4200"
-  run find "4200" | grep -q roof.pdf \
+  # assert on signals only a WORKING pdf extractor produces: zero textless
+  # docs, and a hit carrying a PDF page label (txt files label "part N")
+  run status | grep -q '"textless": 0' \
+    || { echo "SMOKE FAIL: files indexed without text — extractor broken"; exit 1; }
+  run search "roof repair approved" --mode lexical | grep -q '"label": "p\.1' \
     && echo "   PDF text extraction inside the AppImage works" \
-    || { echo "SMOKE FAIL: bundled pdftotext did not extract roof.pdf — see status/tools"; exit 1; }
+    || { echo "SMOKE FAIL: roof.pdf produced no page-labeled text"; exit 1; }
   echo "-- search:"; run search "roof repair approved" --mode lexical
   run status
   # double-click path: bare `ui` must come up, and a second bare `ui` must

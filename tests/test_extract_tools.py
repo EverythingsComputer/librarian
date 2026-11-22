@@ -33,6 +33,28 @@ class ToolEnvTests(unittest.TestCase):
                              "/weird/place")
 
 
+    def test_short_real_text_is_indexed_not_discarded(self):
+        # v0.2.6 regression: <200 chars used to be classified "scanned" and
+        # the EXTRACTED text was thrown away — silent data loss on short PDFs
+        fake = mock.Mock(returncode=0, stdout="ok then\x0c", stderr="")
+        with mock.patch.object(X, "tool_path", lambda n: "/usr/bin/pdftotext"), \
+             mock.patch.object(X.subprocess, "run", mock.Mock(return_value=fake)), \
+             mock.patch.object(X, "_pdfinfo", lambda p: {"Pages": "1"}):
+            ex = X.extract_pdf(Path("/fake.pdf"))
+        self.assertEqual([t for _, t in ex.units], ["ok then"])
+        self.assertFalse(ex.note.startswith("no text layer"))
+
+    def test_zero_chars_is_the_scanned_case(self):
+        fake = mock.Mock(returncode=0, stdout="\x0c\x0c", stderr="")
+        with mock.patch.object(X, "tool_path", lambda n: "/usr/bin/pdftotext"), \
+             mock.patch.object(X.subprocess, "run", mock.Mock(return_value=fake)), \
+             mock.patch.object(X, "_pdfinfo", lambda p: {"Pages": "2"}):
+            ex = X.extract_pdf(Path("/fake.pdf"))
+        self.assertFalse(ex.units)
+        self.assertIn("no text layer", ex.note)
+        self.assertFalse(is_tool_failure(ex.note))  # must NOT auto-retry forever
+
+
 class LoudFailureTests(unittest.TestCase):
     def test_missing_extractor_says_so(self):
         with mock.patch.object(X, "tool_path", lambda n: None):
