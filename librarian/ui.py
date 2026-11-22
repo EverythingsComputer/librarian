@@ -331,7 +331,7 @@ function copyrow(lbl,val,id){return `<div class="crow"><span class="cl">${lbl}</
  <button class="cp" onclick="cp('${id}')">copy</button></div>`}
 function cp(id){navigator.clipboard.writeText(document.getElementById(id).textContent)
  .then(()=>{const b=event.target;b.textContent='copied';setTimeout(()=>b.textContent='copy',1200)})}
-async function regen(){if(!confirm('Generate a NEW access token? The running MCP server keeps the old one until restarted, and every connected client must be updated.'))return;
+async function regen(){if(document.getElementById('tval')&&!confirm('Generate a NEW access token? The running MCP server keeps the old one until restarted, and every connected client must be updated.'))return;
  try{const d=await j('/api/token',{action:'generate'});
   alert('New token: '+d.token+'. '+d.note);conn();}catch(e){alert(e)}}
 async function conn(){
@@ -341,12 +341,6 @@ async function conn(){
    h+=copyrow('Client URL (any MCP app)',c.connect_url,'curl');
    if(c.tailscale_ip)h+=copyrow('This machine on Tailscale',c.tailscale_ip,'tsip');
    if(c.lan_ips.length)h+=copyrow('LAN address(es)',c.lan_ips.join(', '),'lanips');
-   if(c.token_set)h+=`<div class="crow"><span class="cl">Access token</span>
-     <code id="tval">${esc(c.token)}</code>
-     <button class="cp" onclick="cp('tval')">copy</button>
-     <button class="cp" onclick="regen()">regenerate</button></div>
-     <p class="lbl">This page is reachable only from this machine (127.0.0.1); clients elsewhere use the URL above with this token.</p>`;
-   else h+='<p class="err">no token set — add <code>mcp_token</code> under <code>[server]</code> in config.toml or restart with --token; it is required off-localhost</p>';
   }else{
    h+=`<div class="stats" style="margin:0 0 8px"><span style="color:var(--mut)">○ MCP server not running</span> — start it with:</div>`;
    h+=copyrow('Start command',c.serve_cmd,'scmd');
@@ -354,6 +348,15 @@ async function conn(){
    else h+='<p class="err">Tailscale not detected on this machine (install/connect tailscale, or use a LAN address)</p>';
    if(c.lan_ips.length)h+=copyrow('LAN address(es)',c.lan_ips.join(', '),'lanips');
   }
+  // token manager lives OUTSIDE the running/not-running branch: it is needed
+  // to start the server in the first place (chicken-and-egg bug, v0.2.2)
+  if(c.token_set)h+=`<div class="crow"><span class="cl">Access token</span>
+     <code id="tval">${esc(c.token)}</code>
+     <button class="cp" onclick="cp('tval')">copy</button>
+     <button class="cp" onclick="regen()">regenerate</button></div>
+     <p class="lbl">This page is reachable only from this machine (127.0.0.1); clients elsewhere use the URL above with this token. Changing it takes effect when the MCP server restarts, and every connected client must be updated.</p>`;
+  else h+=`<p class="err">No access token set — required before the server can start on a network address.</p>
+     <button class="cp" onclick="regen()">generate a token now</button>`;
   $('conn').innerHTML=h;
  }catch(e){$('conn').innerHTML='<span class="err">'+e+'</span>'}}
 $('q').addEventListener('keydown',async e=>{if(e.key!=='Enter')return;
