@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import errno
 import json
+import os
+import shutil
 import threading
 import time
 import webbrowser
@@ -456,13 +458,30 @@ def _bind(cfg_dir: Path, port: int, explicit: bool):
             f"ports {port}-{port + 25} are all in use; pick one: librarian ui --port N") from None
 
 
+def _open_browser(url: str) -> None:
+    """Open the desktop browser WITHOUT the AppImage's loader overrides.
+    Inheriting our LD_LIBRARY_PATH makes system helpers (kde-open etc.) load
+    the bundled libstdc++ and die, so the page never appeared (v0.2.1)."""
+    import subprocess
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("LD_LIBRARY_PATH", "LD_PRELOAD")}
+    for cmd in ([shutil.which("xdg-open") or "xdg-open", url], ["gio", "open", url]):
+        try:
+            subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            return
+        except OSError:
+            continue
+    webbrowser.open(url)  # last resort
+
+
 def serve(cfg_dir: Path, port: int = DEFAULT_PORT, open_browser: bool = True,
           explicit: bool = False):
     srv, port = _bind(Path(cfg_dir), port, explicit)
     url = f"http://127.0.0.1:{port}/"
     print(f"Librarian UI: {url}  (Ctrl+C to stop)", flush=True)
     if open_browser:
-        threading.Timer(0.7, lambda: webbrowser.open(url)).start()
+        threading.Timer(0.7, _open_browser, args=(url,)).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

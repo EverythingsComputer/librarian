@@ -97,11 +97,14 @@ class Config:
 
     @staticmethod
     def template() -> str:
-        return """# Librarian config — edit paths, then run: librarian build
-[[library]]
-path = "/path/to/your/documents"
-name = "my-library"
-# exclude = ["tmp", ".git"]          # folder-name fragments to skip
+        return """# Librarian config
+# Add your document folders:  librarian add-folder /path/to/your/documents
+# (or press "Add a folder" on the web page:  librarian ui)
+#
+# [[library]]                # one block per folder, or let the commands write them
+# path = "/path/to/your/documents"
+# name = "my-library"
+# exclude = ["tmp", ".git"]  # folder-name fragments to skip
 
 [index]
 ocr = false            # true -> use ocrmypdf for PDFs with no text layer (needs: apt install ocrmypdf)

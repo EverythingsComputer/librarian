@@ -109,7 +109,7 @@ if [ "${SMOKE:-0}" = 1 ]; then
     done
     return 1
   }
-  timeout 40 "$AI" --appimage-extract-and-run ui --no-browser > "$T/ui1.log" 2>&1 &
+  timeout 40 "$AI" --appimage-extract-and-run ui > "$T/ui1.log" 2>&1 &   # no --no-browser: true double-click path
   U1=$!
   P1=$(wait_port "$T/ui1.log" 30) || { echo "SMOKE FAIL: first UI never came up"; cat "$T/ui1.log"; exit 1; }
   curl -sf -o /dev/null "http://127.0.0.1:$P1/" && echo "   first UI answers on $P1"
