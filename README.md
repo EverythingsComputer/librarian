@@ -39,6 +39,10 @@ librarian ui     # opens the control page at http://127.0.0.1:8765
 On the page: **Add a folder** → pick where your documents live → it indexes
 automatically → type a question in the search box.
 
+That's a complete setup. To let an AI assistant use the same library — from
+this machine or another one — follow the three steps in
+[Connecting an AI assistant](#connecting-an-ai-assistant-optional) below.
+
 Without the web page, the same steps are:
 
 ```bash
@@ -78,33 +82,54 @@ librarian sync     # notice files you added or deleted; index the new ones
 ## Connecting an AI assistant (optional)
 
 Librarian speaks MCP, the standard way AI tools attach to outside services.
-Claude Desktop, LMStudio, and many other tools understand it.
+Claude Desktop, LMStudio, Unsloth, Open WebUI, and many other tools
+understand it.
 
-**On the same computer:** give your AI tool this command:
+**Same computer, source install (stdio):** give your AI tool this command:
 
 ```
 command:  ~/librarian-app/.venv/bin/python
 args:     ["-m", "librarian.mcp_server"]
 ```
 
-**From other computers** (e.g. over [Tailscale](https://tailscale.com), a free
-private network): start the server once, then clients use its address:
+**AppImage — or any assistant on another computer (over the network):**
+three steps.
 
-```bash
-librarian mcp-serve --transport http --host <this-machine-ip> --port 8770
-```
+1. **Start the server** on the machine that has the documents. Open a
+   terminal in the folder containing the AppImage and run:
 
-> **AppImage users:** if `librarian` is not on your PATH (the AppImage never
-> installs anything), the literal command above will say `command not found`.
-> Open the UI's "Connect an agent" section instead: its *Start command* box
-> prints the exact command that works for that machine — copy and paste it
-> as-is (v0.2.4+).
+   ```bash
+   ./Librarian-*-x86_64.AppImage mcp-serve --transport http \
+       --host <this-machine-ip> --port 8770
+   ```
 
-Clients connect to `http://<this-machine-ip>:8770/mcp` and authenticate with
-the access token — either as an `Authorization: Bearer <token>` header or, for
-clients that accept only a plain URL, appended as `?token=<token>`. The token
-lives in the settings file and can be shown, changed, or regenerated from the
-web page.
+   (Source installs: `librarian mcp-serve --transport http --host <ip>
+   --port 8770`.) The same command — with the real paths and this
+   machine's address already filled in — appears in the web page's
+   "Connect an agent" section; copy and paste it there instead if you
+   prefer (v0.2.4+).
+
+   The server takes its access token from the settings file automatically
+   (pass `--token <token>` to override). It refuses to start on a network
+   address without a token. It runs until you press Ctrl-C — keep it up
+   with tmux or a systemd service if you want it always on.
+
+2. **Get the token:** on the web page, "Connect an agent" shows the access
+   token; you can also set or regenerate one there.
+
+3. **Point the assistant at the server.** In the client's MCP settings,
+   use this URL:
+
+   ```
+   http://<this-machine-ip>:8770/mcp?token=<token>
+   ```
+
+   If the client can send a header instead, drop the `?token=` part and
+   set `Authorization: Bearer <token>`.
+
+Over [Tailscale](https://tailscale.com) (a free private network),
+`<this-machine-ip>` is the machine's `100.x.y.z` address — the web page
+shows it under "This machine on Tailscale".
 
 Security notes, in plain terms: the web page is reachable only from the
 machine it runs on, by design, because it can display the token. The MCP
