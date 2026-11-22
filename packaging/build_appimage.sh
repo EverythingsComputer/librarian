@@ -151,6 +151,11 @@ PYX
     && echo "   OCR of image-only PDF works (found the zirconium token)" \
     || { echo "SMOKE FAIL: scan-only.pdf was not OCR'd (no 'zirconium' hit)"; exit 1; }
   echo "-- search:"; run search "roof repair approved" --mode lexical
+  # regression (v0.2.8): hyphenated model numbers crashed FTS ('no such column').
+  # zero hits is fine; a non-zero exit is a release blocker.
+  run search "MMP-15 LT2-F Mini-CALIBER Table 3-1" --mode lexical > /dev/null \
+    && echo "   hyphenated-model-number query survived (FTS quoting OK)" \
+    || { echo "SMOKE FAIL: FTS crashed on hyphenated query"; exit 1; }
   run status
   # double-click path: bare `ui` must come up, and a second bare `ui` must
   # slide to a free port instead of dying (v0.2.0 regression class).

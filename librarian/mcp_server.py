@@ -116,7 +116,9 @@ def library(folder: str | None = None, limit: int = 300) -> str:
 def search(query: str, k: int = 10, mode: str = "hybrid", folder: str | None = None) -> str:
     """Top passages for a query. mode: hybrid (default), lexical (exact words/BM25),
     semantic (meaning). folder: restrict to name fragment. Returns snippets with
-    doc_id + page/slide label — cite those."""
+    doc_id + page/slide label — cite those. Any wording is safe, including hyphenated
+    model numbers (LT2-F, MMP-15). To read a hit's page: read_doc(doc_id,
+    label_contains=<the hit's label>)."""
     return _j(S.search(db(), embedder(), query, k=k, mode=mode, folder=folder, exclude_roots=_excl()))
 
 
@@ -133,7 +135,9 @@ def coverage(query: str, k_docs: int = 15) -> str:
     """THE 'ALL NEEDLES' TOOL. For a topic, returns EVERY document that touches it:
     exact term-occurrence counts across the whole library, best snippets per doc, and
     each doc's summary — not just the top passage. Use before answering questions like
-    'what do my documents say about X'. Then read_doc the ones that matter."""
+    'what do my documents say about X'. Broad recall: partial word matches inflate
+    counts — judge docs by concept_chunks/concept_density, confirm with find_term,
+    then read_doc the ones that matter."""
     return _j(S.coverage(db(), embedder(), query, k_docs=k_docs, exclude_roots=_excl()))
 
 
@@ -152,8 +156,12 @@ def doc_card(doc_id: int) -> str:
 
 @mcp.tool()
 def read_doc(doc_id: int, label_contains: str | None = None, max_chars: int = 24000) -> str:
-    """Read a document's text with [p.N]/[slide N] markers. Truncates at max_chars —
-    page through with label_contains (e.g. 'p.12', 'slide 5')."""
+    """Read a document's text with [p.N]/[slide N] markers. Truncates at max_chars;
+    when truncated, the output's last line tells you the NEXT label to request —
+    call again with label_contains set to THAT (never re-read from the start).
+    label_contains selects pages whose label matches ('p.24' matches 'p.24 (cont 1)');
+    if nothing matches you get an error listing real labels — never put product names
+    or body text in it, that is search()'s job."""
     return _j(S.read_doc(db(), doc_id, label_contains=label_contains, max_chars=max_chars))
 
 

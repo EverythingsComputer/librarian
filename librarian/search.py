@@ -10,6 +10,7 @@ with Reciprocal Rank Fusion, plus agent-oriented views:
 from __future__ import annotations
 
 import re
+import sqlite3
 import struct
 from dataclasses import dataclass, field
 
@@ -41,13 +42,22 @@ class Hit:
 
 # ---------------------------------------------------------------- query prep
 
+def _fq(tok: str) -> str:
+    """Wrap a term/phrase as a quoted FTS5 phrase. Quoting makes hyphens,
+    colons and digits in model numbers (MMP-15, LT2-F, Mini-CALIBER, 3-1)
+    safe: unquoted they are parsed as NOT/column operators, which raised
+    'no such column' and killed search() (v0.2.8, agent-log incident)."""
+    return '"' + tok.replace('"', '""') + '"'
+
+
 def fts_query(query: str) -> str:
-    """Keep user-quoted phrases intact; OR the rest for recall (bm25 ranks)."""
+    """Keep user-quoted phrases intact; OR the rest for recall (bm25 ranks).
+    Every term is emitted as a quoted phrase — callers cannot crash MATCH."""
     phrases = re.findall(r'"([^"]+)"', query)
     rest = re.sub(r'"[^"]+"', " ", query)
     toks = [t for t in re.split(r"[^\w\-]+", rest.lower()) if t and t not in STOP and len(t) > 1]
-    parts = [f'"{p.strip()}"' for p in phrases if p.strip()] + toks
-    return " OR ".join(parts) if parts else '"{}"'.format(query.strip())
+    parts = [_fq(p.strip().lower()) for p in phrases if p.strip()] + [_fq(t) for t in toks]
+    return " OR ".join(parts) if parts else _fq(query.strip().lower())
 
 
 def fts_and_query(query: str) -> str:
@@ -55,8 +65,8 @@ def fts_and_query(query: str) -> str:
     phrases = re.findall(r'"([^"]+)"', query)
     rest = re.sub(r'"[^"]+"', " ", query)
     toks = [t for t in re.split(r"[^\w\-]+", rest.lower()) if t and t not in STOP and len(t) > 1]
-    parts = [f'"{p.strip()}"' for p in phrases if p.strip()] + toks
-    return " AND ".join(parts) if parts else '"{}"'.format(query.strip())
+    parts = [_fq(p.strip().lower()) for p in phrases if p.strip()] + [_fq(t) for t in toks]
+    return " AND ".join(parts) if parts else _fq(query.strip().lower())
 
 
 def query_terms(query: str) -> list[str]:
@@ -91,7 +101,36 @@ def _lexical(db, q: str, k: int, folder: str | None, exclude_roots: list[str] | 
       LIMIT ?
     """
     args = [q] + ([f"%{folder}%"] * 3 if folder else []) + rargs + [k]
-    return db.execute(sql, args).fetchall()
+    try:
+        return db.execute(sql, args).fetchall()
+    except sqlite3.OperationalError:
+        # belt-and-braces: never let the agent get a dead tool — degrade to a
+        # LIKE scan over the same corpus (v0.2.8)
+        return _lexical_like(db, q, k, folder, exclude_roots)
+
+
+def _lexical_like(db, q: str, k: int, folder: str | None,
+                  exclude_roots: list[str] | None) -> list:
+    terms = re.findall(r'"((?:[^"]|"")*)"', q) or [q]
+    terms = [t.replace('""', '"') for t in terms if t.strip()]
+    fk = "AND (d.folder LIKE ? OR d.path LIKE ? OR d.root LIKE ?)" if folder else ""
+    rk, rargs = _rx("d", exclude_roots)
+    tk = " AND ".join(["c.text LIKE ?"] * len(terms)) or "1=1"
+    cur = db.execute(f"""
+      SELECT c.id AS chunk_id, c.doc_id, c.label, d.title, d.folder, d.path, d.kind
+      FROM chunks c JOIN docs d ON d.id = c.doc_id
+      WHERE {tk} AND d.dup_of IS NULL {fk} {rk}
+      LIMIT ?""",
+        [f"%{t}%" for t in terms] + ([f"%{folder}%"] * 3 if folder else [])
+        + rargs + [k])
+    cols = [c[0] for c in cur.description]
+    out = []
+    for tup in cur.fetchall():
+        d = dict(zip(cols, tup))
+        d["r"] = 0.0
+        d["snip"] = _text_snippet(db, d["chunk_id"], terms)[:120]
+        out.append(d)
+    return out
 
 
 def _semantic(db, embedder, query: str, k: int, folder: str | None,
@@ -117,7 +156,7 @@ def _text_snippet(db, chunk_id: int, terms: list[str], width: int = 380) -> str:
     row = db.execute("SELECT text FROM chunks WHERE id=?", (chunk_id,)).fetchone()
     if not row:
         return ""
-    text = row["text"]
+    text = row["text"] if isinstance(row, sqlite3.Row) else row[0]
     pos = -1
     for t in terms:
         m = re.search(re.escape(t), text, re.I)
@@ -283,7 +322,7 @@ def coverage(db, embedder, query: str, k_docs: int = 15, chunk_pool: int = 120,
 
 def find_term(db, term: str, k_docs: int = 50, exclude_roots: list[str] | None = None) -> dict:
     """Exact phrase census across the whole library."""
-    q = f'"{term}"'
+    q = _fq(term)
     rk, rargs = _rx("dd", exclude_roots)
     rows = db.execute(
         f"""SELECT c.doc_id AS d, COUNT(*) n FROM chunks_fts
@@ -316,27 +355,53 @@ def read_doc(db, doc_id: int, label_contains: str | None = None,
     meta = db.execute("SELECT * FROM docs WHERE id=?", (doc_id,)).fetchone()
     if not meta:
         return {"error": f"no doc {doc_id}"}
-    q = "SELECT ordinal, label, text FROM chunks WHERE doc_id=? ORDER BY id"
+    conds = ["doc_id=?"]
     params: list = [doc_id]
     if label_contains:
-        q += " AND label LIKE ?"
+        conds.append("label LIKE ?")
         params.append(f"%{label_contains}%")
-    rows = db.execute(q, params).fetchall()
-    parts, total = [], 0
-    for r in rows:
+    # v0.2.8 fix: the label filter used to be appended AFTER ORDER BY, so
+    # SQLite silently ORDERED BY (id AND label LIKE ...) instead of
+    # filtering — every page-targeted read returned the beginning. Agents
+    # burned call after call re-reading page 1.
+    rows = db.execute(
+        f"SELECT ordinal, label, text FROM chunks WHERE {' AND '.join(conds)}"
+        " ORDER BY id", params).fetchall()
+    base = {"doc_id": doc_id, "title": meta["title"], "path": meta["path"],
+            "folder": meta["folder"], "kind": meta["kind"], "pages": meta["pages"]}
+    if label_contains and not rows:
+        labs = [r["label"] for r in db.execute(
+            "SELECT DISTINCT label FROM chunks WHERE doc_id=? ORDER BY id LIMIT 40",
+            (doc_id,)).fetchall()]
+        return {**base,
+                "error": f"no page label matches '{label_contains}'",
+                "labels_sample": labs,
+                "hint": "labels look like 'p.12' or 'slide 3' or 'part 2'; "
+                        "use one of labels_sample, or run search() first and "
+                        "copy the 'label' from the hit you want."}
+    parts, total, last_label = [], 0, None
+    for i, r in enumerate(rows):
         block = f"\n--- [{r['label']}] ---\n{r['text']}"
         if total + len(block) > max_chars:
-            parts.append(f"\n… truncated at {max_chars} chars — call again with label_contains "
-                         f"(e.g. 'p.12' or 'slide 3') to page through. {len(rows)-len(parts)} sections remain.")
+            if not parts:
+                # never return an empty read: give the first slice of the
+                # requested page itself (v0.2.8)
+                room = max(max_chars - 200, 300)
+                parts.append(block[:room])
+                parts.append(f"\n… page [{r['label']}] cut at {room} chars — raise max_chars to see it fully.")
+            else:
+                nxt = r["label"].split(" (cont")[0]
+                parts.append(
+                    f"\n… truncated after [{last_label}] ({i} of "
+                    f"{len(rows)} sections shown). Continue with "
+                    f"label_contains='{nxt}' or raise max_chars.")
             break
         parts.append(block)
         total += len(block)
-    return {
-        "doc_id": doc_id, "title": meta["title"], "path": meta["path"],
-        "folder": meta["folder"], "kind": meta["kind"], "pages": meta["pages"],
-        "summary": meta["summary"], "note": meta["note"],
-        "text": "".join(parts).strip(),
-    }
+        last_label = r["label"]
+    return {**base,
+            "summary": meta["summary"], "note": meta["note"],
+            "text": "".join(parts).strip()}
 
 
 def doc_card(db, doc_id: int) -> dict:
