@@ -26,10 +26,11 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$OUT"
 # 2. AppDir layout: everything under usr/, AppRun + desktop + icon at root
 cp -a "$BUILD/pyi/librarian/." "$APPDIR/usr/bin/"
 
-# 3. bundle pdftotext + pdfinfo + their non-glibc shared-library closure
-# (pdfinfo was never bundled at all: pages/year silently stayed null)
+# 3. bundle pdftotext + pdfinfo + pdftoppm + tesseract + their non-glibc
+# shared-library closure (pdfinfo was once never bundled: pages/year silently
+# stayed null; v0.2.7 adds OCR: pdftoppm renders, tesseract reads, eng data)
 mkdir -p "$BUILD/pdt-libs"
-for BIN in pdftotext pdfinfo; do
+for BIN in pdftotext pdfinfo pdftoppm tesseract; do
 PDT=$(command -v "$BIN")
 [ -n "$PDT" ] || { echo "!! build host lacks $BIN" >&2; exit 1; }
 cp "$PDT" "$APPDIR/usr/bin/$BIN"
@@ -40,6 +41,15 @@ ldd "$PDT" | awk '{ if ($3 ~ /^\//) print $3 }' | while read -r so; do
   esac
 done
 done
+# tesseract language data (English only — keep the download lean)
+TD=${TESSDATA_PREFIX:-$(ls -d /usr/share/tesseract-ocr/*/tessdata 2>/dev/null | head -1)}
+[ -z "$TD" ] && TD=/usr/share/tessdata
+if [ -f "$TD/eng.traineddata" ]; then
+  mkdir -p "$APPDIR/usr/share/tessdata"
+  cp "$TD/eng.traineddata" "$APPDIR/usr/share/tessdata/"
+else
+  echo "!! no eng.traineddata found on build host — OCR will not work" >&2; exit 1
+fi
 # libstdc++ shipped: older hosts may lack a new enough one; poppler/fastembed both want it
 STD=$(ldconfig -p | awk '/libstdc\+\+\.so\.6 /{print $NF; exit}') || true
 [ -n "${STD:-}" ] && cp -L "$STD" "$APPDIR/usr/lib/" || true
@@ -102,22 +112,43 @@ if [ "${SMOKE:-0}" = 1 ]; then
   # a REAL PDF, asserted — a txt-only smoke let the pdftotext breakage ship
   "$PY" - <<'PYX'
 from fpdf import FPDF
-d = FPDF(); d.add_page(); d.set_font("Helvetica", size=12)
+d = FPDF(); d.add_page(); d.set_font("Helvetica", size=18)
 d.cell(text="The roof repair was approved for 4200 dollars.")
 d.output("/tmp/roof-smoke.pdf")
 PYX
   cp /tmp/roof-smoke.pdf "$T/docs/roof.pdf"
+  # an IMAGE-ONLY PDF (render roof.pdf to a picture, re-wrap as PDF):
+  # only a working OCR pipeline can make this searchable
+  pdftoppm -r 300 -png /tmp/roof-smoke.pdf "$T/scanpage"  # 300dpi: clean OCR target
+  "$PY" - <<'PYX'
+from fpdf import FPDF
+d = FPDF(); d.add_page(); d.set_font("Helvetica", size=24)
+d.cell(text="Zirconium gate 9041 calibration was approved by inspector.")
+d.output("/tmp/scan-src.pdf")
+PYX
+  pdftoppm -r 300 -png /tmp/scan-src.pdf "$T/scanpage"
+  "$PY" - <<'PYX'
+from fpdf import FPDF
+import glob
+d = FPDF(); d.add_page()
+d.image(sorted(glob.glob("$T/scanpage*.png"))[0], x=10, y=10, w=190)
+d.output("$T/docs/scan-only.pdf")
+PYX
   run init
   run add-folder "$T/docs"
-  run sync
+  run sync --ocr
   echo "-- find:"; run find "4200"
-  # assert on signals only a WORKING pdf extractor produces: zero textless
-  # docs, and a hit carrying a PDF page label (txt files label "part N")
+  # assert on signals only a WORKING extractor + OCR can produce: zero
+  # textless docs, and BOTH PDFs carrying page labels
   run status | grep -q '"textless": 0' \
-    || { echo "SMOKE FAIL: files indexed without text — extractor broken"; exit 1; }
+    || { echo "SMOKE FAIL: files indexed without text — extractor/OCR broken"; exit 1; }
   run search "roof repair approved" --mode lexical | grep -q '"label": "p\.1' \
     && echo "   PDF text extraction inside the AppImage works" \
     || { echo "SMOKE FAIL: roof.pdf produced no page-labeled text"; exit 1; }
+  OCRHITS=$(run find "zirconium" | grep -c '"occurrences"')
+  [ "$OCRHITS" -ge 1 ] \
+    && echo "   OCR of image-only PDF works (found the zirconium token)" \
+    || { echo "SMOKE FAIL: scan-only.pdf was not OCR'd (no 'zirconium' hit)"; exit 1; }
   echo "-- search:"; run search "roof repair approved" --mode lexical
   run status
   # double-click path: bare `ui` must come up, and a second bare `ui` must

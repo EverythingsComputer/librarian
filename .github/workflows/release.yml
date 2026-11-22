@@ -28,11 +28,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: System packages (poppler = the pdftotext we bundle)
+      - name: System packages (poppler + tesseract = bundled extractors)
         run: |
           set -o pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq poppler-utils > >(tee -a "$DIAG")
+          sudo apt-get install -y -qq poppler-utils tesseract-ocr tesseract-ocr-eng > >(tee -a "$DIAG")
 
       - name: Portable Python (python-build-standalone — hosted-runner
               CPython produces broken PyInstaller launchers)

@@ -135,6 +135,23 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
             if Path(sp).is_file():
                 plans.append(("update", Path(sp)))
                 planned.add(sp)
+    # OCR (v0.2.7): when OCR is enabled and available, scanned stubs get one
+    # attempt. A failed attempt rewrites the note to "...OCR found no readable
+    # text", which is excluded here, so it never re-OCRs on every sync.
+    if cfg.ocr and not force:
+        from .extract import ocr_available
+        if ocr_available():
+            for r in existing.values():
+                sp = str(r["path"])
+                note = r["note"] or ""
+                if (r["kind"] != "empty" or (r["ext"] or "") != "pdf"
+                        or sp in planned or sp not in seen
+                        or not note.startswith("no text layer")
+                        or "OCR found no readable text" in note):
+                    continue
+                if Path(sp).is_file():
+                    plans.append(("update", Path(sp)))
+                    planned.add(sp)
 
     for sp in existing:
         if sp not in seen:
@@ -198,6 +215,7 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
             textless=db.execute(
                 "SELECT COUNT(*) c FROM docs WHERE kind='empty' AND dup_of IS NULL"
             ).fetchone()["c"],
+            ocr=bool(cfg.ocr),
         )
     return db
 
@@ -389,6 +407,9 @@ def status(cfg: Config) -> dict:
         "textless": db.execute(
             "SELECT COUNT(*) c FROM docs WHERE kind='empty' AND dup_of IS NULL").fetchone()["c"],
         "tools": {n: tool_path(n) for n in ("pdftotext", "pdfinfo", "ocrmypdf")},
+        "ocr": {"enabled": bool(cfg.ocr), "available": X.ocr_available(),
+                "tesseract": tool_path("tesseract"),
+                "tessdata": X.tessdata_dir()},
         "duplicates": db.execute("SELECT COUNT(*) c FROM docs WHERE dup_of IS NOT NULL").fetchone()["c"],
         "chunks": db.execute("SELECT COUNT(*) c FROM chunks").fetchone()["c"],
         "dims": int(meta_val("dims", 0)),

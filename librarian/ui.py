@@ -72,6 +72,10 @@ def human_summary(cfg: Config, report: dict) -> str:
     what = ", ".join(parts) if parts else "nothing new"
     off = f" — {len(off_names(cfg))} folder(s) switched off, {hidden} docs hidden" if excl else ""
     warn = ""
+    from .extract import tool_path as _tp
+    if report.get("ocr") and not _tp("tesseract"):
+        warn += (" OCR was requested but tesseract is unavailable here —"
+                 " nothing was OCR'd.")
     if textless and searchable == 0:
         warn = (f" WARNING: none of the {total} files produced any text — the PDF"
                 f" extractor cannot run here (install poppler-utils, or use the"
@@ -255,11 +259,13 @@ def api_state(cfg: Config) -> dict:
                                      "enabled": False, "docs": (c["n"] or 0) - (c["d"] or 0),
                                      "missing": True})
     db.close()
-    from .extract import tool_path
+    from .extract import tool_path, tessdata_dir
     out.update(last_sync=time.strftime("%Y-%m-%d %H:%M", time.localtime(float(row["v"] or 0))) if row else "",
                total_docs=total, duplicates=dups, searchable=searchable,
                textless=textless,
                tools={n: bool(tool_path(n)) for n in ("pdftotext", "pdfinfo")},
+               ocr={"enabled": bool(cfg.ocr),
+                    "available": bool(tool_path("tesseract") and tool_path("pdftoppm"))},
                db_mb=round(cfg.db_path.stat().st_size / 1e6, 1))
     return out
 
@@ -275,7 +281,9 @@ def api_search(cfg: Config, q: str, k: int = 10) -> list[dict]:
              "kind": h["kind"], "score": round(h["score"], 4)} for h in hits]
 
 
-def api_sync(cfg: Config, retry_empty: bool = False) -> dict:
+def api_sync(cfg: Config, retry_empty: bool = False, ocr=None) -> dict:
+    if ocr is not None:
+        cfg.ocr = bool(ocr)          # per-run toggle from the UI checkbox
     if not _sync_lock.acquire(blocking=False):
         return {"busy": True, "message": "A sync is already running."}
     try:
@@ -354,7 +362,8 @@ input:checked+.sl{background:var(--ok)}input:checked+.sl:before{transform:transl
 <div id="results"></div></section>
 
 <section><h2>Keep it up to date</h2>
-<button id="sync" onclick="sync()">Check for new files</button><span id="msg"></span></section>
+<button id="sync" onclick="sync()">Check for new files</button>
+<label class="crow" style="display:inline-flex;min-width:0;margin-left:14px"><input type="checkbox" id="ocr" style="width:auto"><span class="cl" style="min-width:0">OCR scanned PDFs (slower — only files with no text)</span></label><span id="msg"></span></section>
 
 <section><h2>Library folders</h2>
 <div id="libs"></div>
@@ -375,6 +384,9 @@ async function refresh(){
  $('stats').textContent=s.indexed?
   `${s.searchable} of ${s.total_docs} documents searchable · last checked ${s.last_sync} · index ${s.db_mb} MB`:
   'not indexed yet — add a folder and press “Check for new files”';
+ const oc=$('ocr');
+ if(!oc.dataset.init&&s.ocr){oc.checked=!!s.ocr.enabled;oc.dataset.init='1';
+  if(!s.ocr.available){oc.disabled=true;oc.parentElement.title='tesseract is not available on this machine';oc.parentElement.style.opacity=.55;}}
  const w=$('warn');
  if(s.indexed&&s.textless>0){w.style.display='block';
   w.innerHTML=`${s.textless} file(s) have no searchable text. `
@@ -389,11 +401,11 @@ async function refresh(){
   <button class="del" onclick="del('${esc(l.name)}')">Remove</button></div>`).join('')||'<i>No folders yet</i>';
 }
 async function sync(){ $('sync').disabled=true;$('msg').className='';$('msg').textContent='checking…';
- try{const d=await j('/api/sync',{});$('msg').textContent=d.summary||(d.busy?d.message:'done')}
+ try{const d=await j('/api/sync',{ocr:$('ocr').checked});$('msg').textContent=d.summary||(d.busy?d.message:'done')}
  catch(e){$('msg').className='err';$('msg').textContent=''+e}
  $('sync').disabled=false;refresh()}
 async function retryEmpty(){ $('sync').disabled=true;$('msg').textContent='retrying files with no text…';
- try{const d=await j('/api/sync',{retry:true});$('msg').textContent=d.summary||'done'}
+ try{const d=await j('/api/sync',{retry:true,ocr:$('ocr').checked});$('msg').textContent=d.summary||'done'}
  catch(e){$('msg').className='err';$('msg').textContent=''+e}
  $('sync').disabled=false;refresh()}
 async function toggle(n,on){try{await j('/api/toggle',{name:n,enabled:on});refresh()}catch(e){alert(e)}}
@@ -498,7 +510,8 @@ class Handler(BaseHTTPRequestHandler):
         cfg = Config.load(self.cfg_dir)
         try:
             if u.path == "/api/sync":
-                self._json(api_sync(cfg, retry_empty=bool(body.get("retry"))))
+                self._json(api_sync(cfg, retry_empty=bool(body.get("retry")),
+                                    ocr=body.get("ocr") if "ocr" in body else None))
             elif u.path == "/api/add":
                 self._json(api_add(cfg, body.get("path", ""), body.get("name")))
             elif u.path == "/api/toggle":

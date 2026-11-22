@@ -10,11 +10,11 @@ echo "== librarian install -> $DEST"
 
 # 1. system packages: poppler (PDF text extraction) + python3-venv
 if command -v apt-get >/dev/null; then
-  echo "-- installing poppler-utils (needs sudo)"
+  echo "-- installing poppler-utils tesseract-ocr tesseract-ocr-eng (needs sudo)"
   sudo apt-get update -qq
-  sudo apt-get install -y poppler-utils python3-venv
+  sudo apt-get install -y poppler-utils tesseract-ocr tesseract-ocr-eng python3-venv
 fi
-command -v pdftotext >/dev/null || { echo "ERROR: pdftotext missing. Install poppler-utils."; exit 1; }
+command -v pdftotext >/dev/null || { echo "ERROR: pdftotext missing. Install poppler-utils tesseract-ocr tesseract-ocr-eng."; exit 1; }
 
 # 2. python: prefer uv (fast, can fetch its own python), fall back to system python
 if command -v uv >/dev/null 2>&1; then

@@ -107,7 +107,7 @@ class Config:
 # exclude = ["tmp", ".git"]  # folder-name fragments to skip
 
 [index]
-ocr = false            # true -> use ocrmypdf for PDFs with no text layer (needs: apt install ocrmypdf)
+ocr = false            # true -> OCR scanned PDFs at index time (bundled in the AppImage; source: apt install tesseract-ocr tesseract-ocr-eng)
 max_file_mb = 150      # skip anything larger than this
 index_archives = false # true -> peek inside .zip files
 

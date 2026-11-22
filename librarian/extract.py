@@ -111,9 +111,14 @@ def extract_pdf(path: Path, ocr: bool = False, ocr_lang: str = "eng") -> Extract
     npages_meta = int(meta.get("Pages", "0") or 0)
     if total_chars == 0 and npages_meta > 0:
         # genuinely no characters came out: scanned (or an image-only PDF)
-        if ocr and tool_path("ocrmypdf"):
-            return _ocr_pdf(path, meta)
-        ex.note = f"no text layer ({npages_meta} pages) — scanned? enable [index] ocr=true or OCR the file"
+        if ocr:
+            if ocr_available():
+                return _ocr_pdf(path, meta, ocr_lang)
+            ex.note = (f"no text layer ({npages_meta} pages) — scanned; OCR is ON "
+                       f"but tesseract/pdftoppm is unavailable here")
+            return ex
+        ex.note = (f"no text layer ({npages_meta} pages) — scanned? turn on OCR "
+                   f"in the web page or run: sync --ocr")
         return ex
     if total_chars < 200 and npages_meta > 3:
         # sparse but REAL text: index it, warn softly (v0.2.6: the old
@@ -125,26 +130,67 @@ def extract_pdf(path: Path, ocr: bool = False, ocr_lang: str = "eng") -> Extract
     return ex.finalize()
 
 
-def _ocr_pdf(path: Path, meta: dict) -> Extracted:
+def tessdata_dir():
+    """Where eng.traineddata lives: explicit env, then the bundle
+    (usr/share/tessdata next to our bin dir), then common host locations."""
+    cands = []
+    env = os.environ.get("TESSDATA_PREFIX")
+    if env:
+        cands.append(Path(env))
+    bd = _bundle_bin()
+    if bd is not None:
+        cands.append(bd.parent / "share" / "tessdata")
+    cands += [Path("/usr/share/tesseract-ocr/5/tessdata"),
+              Path("/usr/share/tesseract-ocr/6/tessdata"),
+              Path("/usr/share/tessdata")]
+    for c in cands:
+        if (c / "eng.traineddata").exists():
+            return str(c)
+    return None
+
+
+def ocr_available() -> bool:
+    return bool(tool_path("tesseract") and tool_path("pdftoppm"))
+
+
+def _ocr_pdf(path: Path, meta: dict, lang: str = "eng") -> Extracted:
+    """OCR for image-only PDFs: pdftoppm renders pages, tesseract reads them.
+    v0.2.7 replaces the ocrmypdf route: no Ghostscript to bundle, and the
+    user's file is never rewritten — OCR text goes into the index only."""
     import tempfile
     ex = Extracted()
-    ex.note = "OCR'd at index time"
+    ppm, tess = tool_path("pdftoppm"), tool_path("tesseract")
+    npages = int(meta.get("Pages", "0") or 0)
+    max_pages = min(npages or 500, 500)
     with tempfile.TemporaryDirectory() as td:
-        out = Path(td) / "ocr.pdf"
-        ocr_bin = tool_path("ocrmypdf")
-        pdf_bin2 = tool_path("pdftotext")
-        subprocess.run(
-            [ocr_bin, "--skip-text", "--quiet", str(path), str(out)],
-            capture_output=True, text=True, timeout=1800, env=tool_env(ocr_bin),
-        )
-        text = subprocess.run(
-            [pdf_bin2, "-enc", "UTF-8", str(out), "-"],
-            capture_output=True, text=True, errors="replace", timeout=300,
-            env=tool_env(pdf_bin2),
-        ).stdout
-    for i, p in enumerate([normalize_text(p) for p in text.split("\x0c") if normalize_text(p)], 1):
-        ex.units.append((f"p.{i}", p))
-    return ex.finalize()
+        r = subprocess.run(
+            [ppm, "-r", "200", "-png", "-l", str(max_pages), str(path),
+             str(Path(td) / "pg")],
+            capture_output=True, text=True, timeout=1800, env=tool_env(ppm))
+        if r.returncode != 0:
+            ex.note = (f"OCR render failed (exit {r.returncode}): "
+                       f"{(r.stderr or '').strip()[:160]}")
+            return ex
+        pngs = sorted(Path(td).glob("pg-*.png"))
+        td_dir = tessdata_dir()
+        for i, png in enumerate(pngs, 1):
+            cmd = [tess, str(png), "-", "-l", lang]
+            if td_dir:
+                cmd += ["--tessdata-dir", td_dir]
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True,
+                                     errors="replace", timeout=120,
+                                     env=tool_env(tess)).stdout
+            except Exception:
+                out = ""
+            t = normalize_text(out)
+            if t:
+                ex.units.append((f"p.{i}", t))
+    if ex.units:
+        ex.note = "OCR'd at index time (search text only; your file is unchanged)"
+        return ex.finalize()
+    ex.note = f"no text layer ({npages or len(pngs)} pages) — OCR found no readable text"
+    return ex
 
 
 def _pdfinfo(path: Path) -> dict:

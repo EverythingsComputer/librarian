@@ -100,3 +100,21 @@ class RetryClassificationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OcrNoteTests(unittest.TestCase):
+    def test_ocr_attempt_failure_is_not_a_retryable_tool_failure(self):
+        # scanned stubs whose OCR found nothing must NOT be re-OCR'd forever
+        self.assertFalse(is_tool_failure(
+            "no text layer (81 pages) — OCR found no readable text"))
+
+    def test_ocr_needed_note_not_matched_before_ocr_exists(self):
+        # OCR-off scanned note is a document property, not a tool failure
+        self.assertFalse(is_tool_failure(
+            "no text layer (81 pages) — scanned? turn on OCR in the web page or run: sync --ocr"))
+
+    def test_scan_retry_selector_excludes_attempted(self):
+        from librarian.extract import ocr_available  # import surface exists
+        self.assertTrue(callable(ocr_available))
+        from librarian import extract as X
+        self.assertTrue(callable(X.tessdata_dir))

@@ -59,6 +59,8 @@ def _excl(cfg: Config, args=None) -> list[str] | None:
 
 def cmd_sync(args):
     cfg = _cfg(args)
+    if getattr(args, "ocr", False):
+        cfg.ocr = True
     from .ingest import build_or_update
     report: dict = {}
     build_or_update(cfg, report=report, retry_empty=getattr(args, "retry_empty", False))
@@ -159,6 +161,8 @@ def cmd_mcp_serve(args):
 
 def cmd_build(args):
     cfg = _cfg(args)
+    if getattr(args, "ocr", False):
+        cfg.ocr = True
     from .ingest import build_or_update
     build_or_update(cfg, force=args.force, use_llm_summaries=args.llm, limit=args.limit,
                     retry_empty=getattr(args, "retry_empty", False))
@@ -290,13 +294,17 @@ def main(argv=None):
     p.add_argument("--force", action="store_true", help="re-extract everything")
     p.add_argument("--retry-empty", action="store_true",
                    help="also re-extract every empty PDF, including true scans")
+    p.add_argument("--ocr", action="store_true",
+                   help="OCR scanned PDFs with no text layer (needs tesseract; bundled in the AppImage)")
     p.add_argument("--limit", type=int, default=0, help="debug: cap files")
     p.set_defaults(fn=cmd_build)
     p = sub.add_parser("update", parents=[common])
     p.add_argument("--llm", action="store_true")
     p.add_argument("--retry-empty", action="store_true")
+    p.add_argument("--ocr", action="store_true")
     p.set_defaults(fn=lambda a: cmd_build(argparse.Namespace(
-        llm=a.llm, force=False, limit=0, data=a.data, retry_empty=a.retry_empty)))
+        llm=a.llm, force=False, limit=0, data=a.data,
+        retry_empty=a.retry_empty, ocr=a.ocr)))
     p = sub.add_parser("status", parents=[common]); p.set_defaults(fn=cmd_status)
     p = sub.add_parser("ls", parents=[common]); p.add_argument("--folder"); p.add_argument("--limit", type=int, default=400); p.set_defaults(fn=cmd_ls)
     p = sub.add_parser("card", parents=[common]); p.add_argument("doc_id", type=int); p.set_defaults(fn=cmd_card)
@@ -340,6 +348,8 @@ def main(argv=None):
     p.add_argument("--json", action="store_true", help="machine-readable report instead of prose")
     p.add_argument("--retry-empty", action="store_true",
                    help="also re-extract every empty PDF, including true scans")
+    p.add_argument("--ocr", action="store_true",
+                   help="OCR scanned PDFs with no text layer")
     p.set_defaults(fn=cmd_sync)
     p = sub.add_parser("folders", parents=[common], help="list library folders and on/off state")
     p.add_argument("--json", action="store_true")

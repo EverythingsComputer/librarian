@@ -54,8 +54,8 @@ librarian search "what did we decide about the roof repair"
 ## Requirements
 
 - Linux (written and tested on Ubuntu 24.04+, x86_64), Python 3.10+
-- `poppler-utils` for source installs — the **AppImage needs none of this**;
-  it ships and uses its own PDF extractor (v0.2.5+)
+- `poppler-utils` + `tesseract-ocr` for source installs — the **AppImage
+  needs none of this**; it ships its own PDF extractor and OCR engine (v0.2.7+)
 - About 1.5 GB free disk the first time (a small search model downloads once)
 - Older 4-core mini PCs and laptops are enough; no graphics card needed.
   Indexing uses about 1–1.5 GB of memory; searching uses much less.
@@ -79,6 +79,12 @@ Daily upkeep is one command, or one button on the web page:
 ```bash
 librarian sync     # notice files you added or deleted; index the new ones
 ```
+
+Scanned PDFs: tick **OCR scanned PDFs** next to the update button (or run
+`librarian sync --ocr`, or set `ocr = true` in the settings file). Only files
+with no text layer are OCR'd, their originals are never modified, and files
+already OCR'd are not re-done. The AppImage bundles the OCR engine — no
+install needed; source installs need `tesseract-ocr` (install.sh does it).
 
 Honesty guarantee (v0.2.5): "searchable" counts only files that actually
 produced text. If anything failed to extract, the page says how many and why,
