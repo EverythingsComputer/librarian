@@ -297,8 +297,11 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
                 break
             _delete_doc(db, existing[sp]["id"])
             removed_n += 1
+            print(f"- removed {sp}")
             if (i + 1) % 200 == 0:
                 db.commit()
+        if removed_n:
+            print(f"prune: {removed_n} index row(s) removed for files gone from disk")
         db.commit()
 
     _mark_duplicates(db)
