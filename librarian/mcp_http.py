@@ -73,6 +73,8 @@ def serve(cfg_dir: Path | None, host: str = "127.0.0.1", port: int = 8770,
         stateless_http=stateless,   # true = friendlier behind proxies, no session resume
         host=host,                  # used by the SDK's DNS-rebinding Host check
     )
+    from .ingest import install_shutdown_hook
+    install_shutdown_hook(app)      # Ctrl-C must stop an in-flight build/prune
     if token:
         app = _bearer_guard(app, token)
 

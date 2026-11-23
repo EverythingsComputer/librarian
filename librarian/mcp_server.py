@@ -90,11 +90,6 @@ def _excl() -> list[str] | None:
     return Config.load(cfg().data_dir).disabled_roots or None
 
 
-import threading
-
-_build_gate = threading.Lock()
-_building = {"on": False}
-
 INSTRUCTIONS_NOTE = "see server instructions"
 
 
@@ -135,9 +130,10 @@ def coverage(query: str, k_docs: int = 15) -> str:
     """THE 'ALL NEEDLES' TOOL. For a topic, returns EVERY document that touches it:
     exact term-occurrence counts across the whole library, best snippets per doc, and
     each doc's summary — not just the top passage. Use before answering questions like
-    'what do my documents say about X'. Broad recall: partial word matches inflate
-    counts — judge docs by concept_chunks/concept_density, confirm with find_term,
-    then read_doc the ones that matter."""
+    'what do my documents say about X'. Lexical census (no semantic drift, safe on huge
+    libraries); for meaning-based recall use search. Broad recall: partial word matches
+    inflate counts — judge docs by concept_chunks/concept_density, confirm with
+    find_term, then read_doc the ones that matter."""
     return _j(S.coverage(db(), embedder(), query, k_docs=k_docs, exclude_roots=_excl()))
 
 
@@ -173,28 +169,28 @@ def related(doc_id: int, k: int = 8) -> str:
 
 @mcp.tool()
 def update_index() -> str:
-    """Scan library roots and index new/changed files (incremental, safe to call).
-    Use when the user says they just added or changed files. Files that failed
-    earlier because an extraction tool was missing are retried automatically."""
-    # in-process (v0.2.5): the old child launch `sys.executable -m librarian.cli`
-    # never worked inside the AppImage — the executable there is a frozen
-    # binary with no -m flag, so this tool always returned "update failed".
-    with _build_gate:
-        if _building["on"]:
-            return "a sync is already running; try again in a minute"
-        _building["on"] = True
+    """Scan library roots and index new/changed files (incremental). Use when
+    the user says they just added or changed files. Files that failed earlier
+    because an extraction tool was missing are retried automatically.
+    It also drops index rows for files that are GONE — with guardrails: a root
+    that scans as empty is treated as an offline mount (protected), and a mass
+    deletion (>25% of the library) is BLOCKED, not executed. If you (the agent)
+    are running on a DIFFERENT machine than this server, never call this to
+    'check' something — the server sees its own disks, you see none."""
+    from .ingest import SYNC_LOCK, GLOBAL_CANCEL, build_or_update
+    if not SYNC_LOCK.acquire(blocking=False):
+        return "a sync is already running; try again in a minute"
+    GLOBAL_CANCEL.clear()
     try:
-        from .ingest import build_or_update
         rep: dict = {}
-        build_or_update(cfg(), report=rep)
-        return ("added=%s changed=%s removed=%s docs=%s chunks=%s seconds=%s textless=%s"
-                % tuple(rep.get(k) for k in ("added", "changed", "removed",
-                                             "docs", "chunks", "seconds", "textless")))
+        build_or_update(cfg(), report=rep, cancel=GLOBAL_CANCEL)
+        return ("added=%s changed=%s removed=%s blocked=%s cancelled=%s docs=%s chunks=%s seconds=%s textless=%s"
+                % tuple(rep.get(k) for k in ("added", "changed", "removed", "prune_blocked",
+                                             "cancelled", "docs", "chunks", "seconds", "textless")))
     except Exception as e:
         return f"update failed: {type(e).__name__}: {e}"
     finally:
-        with _build_gate:
-            _building["on"] = False
+        SYNC_LOCK.release()
 
 
 if __name__ == "__main__":

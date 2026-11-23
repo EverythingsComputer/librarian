@@ -51,11 +51,42 @@ def _bundle_bin():
     return None
 
 
+def fix_mojibake(s: str) -> str:
+    """Repair UTF-8 bytes misread as cp1252/latin-1 (classic PDF /Title bug):
+    'Ù—' back to 'اٗ'. Only accepted when the round-trip yields real text and
+    changes the string; correctly-decoded titles pass through untouched (B2)."""
+    if not s or all(ord(c) < 128 for c in s):
+        return s
+    for enc in ("cp1252", "latin-1"):
+        try:
+            b = s.encode(enc)
+        except UnicodeEncodeError:
+            continue
+        try:
+            r = b.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if r != s:
+            return r
+    return s
+
+
 def tool_path(name: str):
     """Resolve an external helper (pdftotext, pdfinfo, ocrmypdf). Inside a
     bundle the launcher puts the bundled bin dir first on PATH (v0.2.5), so
-    bundled poppler wins over a host one the bundled loader env would kill."""
-    return shutil.which(name)
+    bundled poppler wins over a host one the bundled loader env would kill.
+    v0.2.9: when the bundle is started by its direct path (the UI 'Start
+    command' prints /tmp/.mount_*/usr/bin/librarian ... — no AppRun, so PATH
+    is untouched), also look next to the executable itself."""
+    found = shutil.which(name)
+    if found:
+        return found
+    bd = _bundle_bin()
+    if bd is not None:
+        cand = bd / name
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
 
 
 def tool_env(path=None) -> dict:
@@ -83,7 +114,7 @@ def tool_env(path=None) -> dict:
 def extract_pdf(path: Path, ocr: bool = False, ocr_lang: str = "eng") -> Extracted:
     ex = Extracted()
     meta = _pdfinfo(path)
-    ex.title = meta.get("Title", "").strip()
+    ex.title = fix_mojibake(meta.get("Title", "").strip())
     cd = meta.get("CreationDate", "")
     m = re.search(r"D(\d{4})", cd)
     if m:

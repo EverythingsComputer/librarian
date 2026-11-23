@@ -21,7 +21,7 @@ from urllib.parse import urlparse, parse_qs
 from .config import (Config, add_root, find_root, remove_root,
                      set_root_enabled)
 
-_sync_lock = threading.Lock()
+_sync_lock = threading.Lock()   # superseded by ingest.SYNC_LOCK (shared with MCP)
 _embedder = None
 _embedder_lock = threading.Lock()
 
@@ -76,6 +76,13 @@ def human_summary(cfg: Config, report: dict) -> str:
     if report.get("ocr") and not _tp("tesseract"):
         warn += (" OCR was requested but tesseract is unavailable here —"
                  " nothing was OCR'd.")
+    if report.get("prune_blocked"):
+        warn += (f" PRUNE BLOCKED: {report['prune_blocked']} files appear to have"
+                 " vanished at once — looks like an offline mount, nothing was"
+                 " removed. Check the folder is online; if the files really are"
+                 " gone, re-run with LIBRARIAN_ALLOW_MASS_PRUNE=1.")
+    if report.get("cancelled"):
+        warn += " (sync was cancelled mid-run — nothing pruned; run again to continue)"
     if textless and searchable == 0:
         warn = (f" WARNING: none of the {total} files produced any text — the PDF"
                 f" extractor cannot run here (install poppler-utils, or use the"
@@ -282,17 +289,18 @@ def api_search(cfg: Config, q: str, k: int = 10) -> list[dict]:
 
 
 def api_sync(cfg: Config, retry_empty: bool = False, ocr=None) -> dict:
-    if ocr is not None:
-        cfg.ocr = bool(ocr)          # per-run toggle from the UI checkbox
-    if not _sync_lock.acquire(blocking=False):
+    if ocr is not None and bool(ocr) != cfg.ocr:
+        from .config import set_ocr
+        set_ocr(cfg, bool(ocr))    # persisted: survives refresh, visible to status()
+    from .ingest import SYNC_LOCK, build_or_update
+    if not SYNC_LOCK.acquire(blocking=False):
         return {"busy": True, "message": "A sync is already running."}
     try:
-        from .ingest import build_or_update
         report: dict = {}
         build_or_update(cfg, report=report, retry_empty=retry_empty)
         return {"busy": False, "report": report, "summary": human_summary(cfg, report)}
     finally:
-        _sync_lock.release()
+        SYNC_LOCK.release()
 
 
 def api_add(cfg: Config, path: str, name: str | None) -> dict:
@@ -578,4 +586,6 @@ def serve(cfg_dir: Path, port: int = DEFAULT_PORT, open_browser: bool = True,
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
+        from .ingest import GLOBAL_CANCEL
+        GLOBAL_CANCEL.set()      # stop an in-flight sync/prune before we exit
         print("\nstopped")

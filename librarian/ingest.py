@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -16,9 +17,42 @@ from .chunk import chunk_units, embed_text
 from .config import Config, DOC_EXTS, TEXT_EXTS, SKIP_EXTS, MEDIA_EXTS
 from .db import connect, init_db
 
+# single lock for every sync entry point (UI, MCP tool, CLI) — v0.2.9:
+# ui._sync_lock and mcp._build_gate were separate, so an agent-driven
+# update_index and a UI sync could run against the same SQLite file at once.
+SYNC_LOCK = threading.Lock()
+
+# set by server shutdown hooks and Ctrl-C; the ingest loop checks it between
+# batches so a long build — especially its prune phase — actually stops
+# (v0.2.9 incident: an agent cancelled update_index, the client gave up, and
+# the server kept deleting rows through 'Finished server process').
+GLOBAL_CANCEL = threading.Event()
+
+
+def install_shutdown_hook(app):
+    """Starlette/uvicorn apps call this so server shutdown stops an in-flight
+    build instead of letting its prune outrun 'Finished server process' (A2)."""
+    try:
+        app.router.on_shutdown.append(GLOBAL_CANCEL.set)
+    except AttributeError:
+        pass
+
 KIND_BY_EXT = {
     "pdf": "pdf", "pptx": "pptx", "docx": "docx", "msg": "msg",
 }
+
+_OOXML_DIRS = {"_rels", "docprops", "word", "xl", "ppt", "customxml"}
+
+
+def _ooxml_internals(p: Path) -> bool:
+    """True for the unzipped innards of an Office package (someone unpacked a
+    .docx in place): [Content_Types].xml, word/document.xml, docProps/*, ...
+    Those are XML schema boilerplate, not documents (v0.2.9 B1)."""
+    if p.name.lower() == "[content_types].xml":
+        return True
+    if p.suffix.lower() != ".xml":
+        return False
+    return bool({x.lower() for x in p.parts[:-1]} & _OOXML_DIRS)
 
 
 def walk_files(cfg: Config):
@@ -30,6 +64,8 @@ def walk_files(cfg: Config):
             dirnames[:] = sorted(d for d in dirnames if not _excluded(root, dirpath, d, dirnames))
             for fn in sorted(filenames):
                 p = Path(dirpath) / fn
+                if _ooxml_internals(p):
+                    continue
                 yield root, p
 
 
@@ -73,11 +109,21 @@ def is_tool_failure(note: "str | None") -> bool:
 
 
 def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = False, limit: int = 0,
-                    report: dict | None = None, retry_empty: bool = False):
+                    report: dict | None = None, retry_empty: bool = False,
+                    cancel: threading.Event | None = None):
     """Scan all configured roots and index new/changed files. When `report` is
     passed it receives machine-readable counts (added/changed/removed/seconds/
-    docs/chunks) so callers like `sync` and the web UI can summarize."""
+    docs/chunks) so callers like `sync` and the web UI can summarize.
+
+    Prune safety (v0.2.9 — an agent's update_index wiped 2,501 rows when the
+    USB root went briefly unreadable): a root that yields ZERO files this scan
+    is treated as unreadable, and nothing under it is pruned; a prune that
+    would remove a large fraction of the library is blocked outright; the
+    prune runs at the END of the build and checks `cancel` between batches."""
     from .embed import Embedder
+
+    cancel = cancel or GLOBAL_CANCEL
+    GLOBAL_CANCEL.clear()   # single-flight (SYNC_LOCK) makes this safe
 
     probe = Embedder(cfg.embed_backend, cfg.embed_model, cfg.embed_base_url, cfg.embed_api_key)
     if cfg.embed_backend == "fastembed":
@@ -91,11 +137,23 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
     db = init_db(cfg.db_path, probe.dims)
     existing = {r["path"]: r for r in db.execute("SELECT * FROM docs")}
 
+    # B1 cleanup: previously-indexed OOXML package internals go now, whatever
+    # the prune settings say.
+    junk = [r for sp, r in existing.items() if _ooxml_internals(Path(sp))]
+    for r in junk:
+        _delete_doc(db, r["id"])
+        print(f"- removed (office package internals) {r['path']}")
+    if junk:
+        existing = {sp: r for sp, r in existing.items()
+                    if r["id"] not in {j['id'] for j in junk}}
+
     plans: list[tuple[str, Path]] = []   # ('new'|'update', path)
     seen: set[str] = set()
+    scanned_per_root: dict[str, int] = {str(r.path): 0 for r in cfg.roots}
     for root, p in walk_files(cfg):
         sp = str(p)
         seen.add(sp)
+        scanned_per_root[str(root.path)] = scanned_per_root.get(str(root.path), 0) + 1
         ext = p.suffix.lower().lstrip(".")
         if ext in SKIP_EXTS or (ext not in DOC_EXTS and ext not in TEXT_EXTS and not (ext == "zip" and cfg.index_archives)):
             if ext not in MEDIA_EXTS:
@@ -111,6 +169,7 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
             plans.append(("new", p))
         elif force or abs(st.st_mtime - row["mtime"]) > 1 or st.st_size != row["size"]:
             plans.append(("update", p))
+    print("scanned: " + ", ".join(f"{k} -> {v} files" for k, v in scanned_per_root.items()))
 
     # self-heal (v0.2.5): re-extract empty stubs whose stored note says the
     # EXTRACTOR failed, now that a working one exists. Converges in one run:
@@ -153,11 +212,7 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
                     plans.append(("update", Path(sp)))
                     planned.add(sp)
 
-    for sp in existing:
-        if sp not in seen:
-            _delete_doc(db, existing[sp]["id"])
-            print(f"- removed {sp}")
-    removed_n = sum(1 for sp in existing if sp not in seen)
+    # (prune moved to the END of the build, guarded — see v0.2.9 note above)
 
     if limit:
         plans = plans[:limit]
@@ -177,7 +232,12 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
 
     t0 = time.time()
     done = 0
+    cancelled = False
     for kind, p in plans:
+        if cancel.is_set():
+            cancelled = True
+            print(f"!! cancelled after {done}/{total} files — nothing pruned; re-run sync to continue")
+            break
         done += 1
         root_name = next((r.name for r in cfg.roots if str(p).startswith(str(r.path))), "")
         rel = p.relative_to(next(r.path for r in cfg.roots if str(p).startswith(str(r.path))))
@@ -194,6 +254,53 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
             print(f"  [{done}/{total}] {el:.0f}s elapsed, {p.name[:60]}")
             db.commit()
 
+    # ---- guarded prune (v0.2.9) ------------------------------------------------
+    # Rules learned from the incident where a transiently-unreadable USB root
+    # looked like 2,501 deleted files and the index obeyed:
+    #   * runs AFTER indexing, so a killed build never prunes;
+    #   * a root that scanned 0 files this run is 'unreadable' — its docs are
+    #     left alone, with a loud note;
+    #   * if the prune would still remove >25% of the library (>100 docs),
+    #     it is BLOCKED and only reported;
+    #   * the loop is cancellable and commits in batches, so a cancel leaves
+    #     a consistent index of whatever it already did.
+    removed_n = 0
+    prune_blocked = 0
+    unreadable = {k for k, n in scanned_per_root.items() if n == 0}
+    if unreadable:
+        print("!! prune skipped for unreadable root(s) (0 files scanned): "
+              + ", ".join(unreadable)
+              + " — if that mount should be online, remount it and sync again")
+    if cancelled:
+        print("!! prune skipped (build was cancelled)")
+    else:
+        gone = []
+        for sp in existing:
+            if sp in seen:
+                continue
+            base = next((k for k in scanned_per_root if sp.startswith(k + os.sep)), None)
+            if base in unreadable:
+                continue
+            gone.append(sp)
+        under_ok = sum(1 for sp in existing
+                       if next((k for k in scanned_per_root if sp.startswith(k + os.sep)), None)
+                       not in unreadable)
+        mass_ok = os.environ.get("LIBRARIAN_ALLOW_MASS_PRUNE") == "1"
+        if not mass_ok and len(gone) > max(100, under_ok // 4):
+            prune_blocked = len(gone)
+            print(f"!! prune BLOCKED: {len(gone)} files vanished from disk at once "
+                  f"(out of {under_ok}). That smells like a mount/network problem, "
+                  f"not a mass delete — NOTHING removed. If the files really are "
+                  f"gone on purpose, re-run with LIBRARIAN_ALLOW_MASS_PRUNE=1.")
+        for i, sp in enumerate(gone):
+            if prune_blocked or cancel.is_set():
+                break
+            _delete_doc(db, existing[sp]["id"])
+            removed_n += 1
+            if (i + 1) % 200 == 0:
+                db.commit()
+        db.commit()
+
     _mark_duplicates(db)
     _link_transcripts(db)
     db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('last_build',?)", (str(time.time()),))
@@ -209,6 +316,9 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
             added=sum(1 for k, _ in plans if k == "new"),
             changed=sum(1 for k, _ in plans if k == "update"),
             removed=removed_n,
+            prune_blocked=prune_blocked,
+            cancelled=cancelled,
+            junk=len(junk),
             seconds=round(elapsed, 1),
             docs=n_docs,
             chunks=n_chunks,
@@ -406,7 +516,7 @@ def status(cfg: Config) -> dict:
         "with_text": db.execute("SELECT COUNT(*) c FROM docs WHERE chars>0").fetchone()["c"],
         "textless": db.execute(
             "SELECT COUNT(*) c FROM docs WHERE kind='empty' AND dup_of IS NULL").fetchone()["c"],
-        "tools": {n: tool_path(n) for n in ("pdftotext", "pdfinfo", "ocrmypdf")},
+        "tools": {n: tool_path(n) for n in ("pdftotext", "pdfinfo", "pdftoppm", "tesseract")},
         "ocr": {"enabled": bool(cfg.ocr), "available": X.ocr_available(),
                 "tesseract": tool_path("tesseract"),
                 "tessdata": X.tessdata_dir()},

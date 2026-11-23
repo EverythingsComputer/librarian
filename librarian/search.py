@@ -139,17 +139,29 @@ def _semantic(db, embedder, query: str, k: int, folder: str | None,
     pack = struct.pack(f"{len(qv)}f", *qv)
     fk = "AND (d.folder LIKE ? OR d.path LIKE ? OR d.root LIKE ?)" if folder else ""
     rk, rargs = _rx("d", exclude_roots)
-    sql = f"""
-      SELECT v.chunk_id, v.distance, c.doc_id, c.label, d.title, d.folder, d.path, d.kind
-      FROM vec_chunks v
-      JOIN chunks c ON c.id = v.chunk_id
-      JOIN docs d ON d.id = c.doc_id
-      WHERE v.embedding MATCH ? AND k = ? {fk} AND d.dup_of IS NULL {rk}
-      ORDER BY v.distance
-      LIMIT ?
-    """
-    args = [pack, k * 4] + ([f"%{folder}%"] * 3 if folder else []) + rargs + [k * 4]
-    return db.execute(sql, args).fetchall()
+    # v0.2.9: pure ANN FIRST (no joins in the vec query — constrained vec0
+    # MATCH degrades to a brute scan of every vector, which is what made
+    # coverage() exceed 300s on a 677k-chunk index), then filter/expand the
+    # handful of hits through the relational side.
+    ann = db.execute(
+        "SELECT chunk_id, distance FROM vec_chunks WHERE embedding MATCH ? AND k = ?",
+        (pack, min(k * 8, 256))).fetchall()
+    if not ann:
+        return []
+    dist = {int(a["chunk_id"]): a["distance"] for a in ann}
+    ph = ",".join("?" * len(dist))
+    rows = db.execute(f"""
+      SELECT c.id AS chunk_id, c.doc_id, c.label, d.title, d.folder, d.path, d.kind
+      FROM chunks c JOIN docs d ON d.id = c.doc_id
+      WHERE c.id IN ({ph}) AND d.dup_of IS NULL {fk} {rk}""",
+        [*dist, *([f"%{folder}%"] * 3 if folder else []), *rargs]).fetchall()
+    out = []
+    for r in rows:
+        r = dict(r)
+        r["distance"] = dist[r["chunk_id"]]
+        out.append(r)
+    out.sort(key=lambda r: r["distance"])
+    return out[:k]
 
 
 def _text_snippet(db, chunk_id: int, terms: list[str], width: int = 380) -> str:
@@ -233,7 +245,10 @@ def coverage(db, embedder, query: str, k_docs: int = 15, chunk_pool: int = 120,
     best snippets, and doc summary."""
     q = fts_query(query)
     q_and = fts_and_query(query)
-    hits = search(db, embedder, query, k=chunk_pool, mode="hybrid", exclude_roots=exclude_roots)
+    # lexical pool only (v0.2.9 C1): coverage runs on libraries with 10^5-10^6
+    # chunks; embedding + vector scan here doubled a cost we don't need —
+    # coverage's contract is the EXACT census, semantic recall is search()'s.
+    hits = search(db, embedder, query, k=chunk_pool, mode="lexical", exclude_roots=exclude_roots)
     rk, rargs = _rx("dd", exclude_roots)
 
     def census(expr):
@@ -251,8 +266,14 @@ def coverage(db, embedder, query: str, k_docs: int = 15, chunk_pool: int = 120,
             pass
         return out
 
-    occ = census(q)          # term-occurrence volume (broad)
+    occ_all = census(q)          # term-occurrence volume (broad)
     concept = census(q_and)  # chunks containing ALL key terms (precise)
+    # v0.2.9 C1: a broad OR query's census covers thousands of docs; the old
+    # code ran a per-doc snippet query for EVERY census-only doc — each one a
+    # full-corpus MATCH rescan. That is the 300s timeout, not the vectors.
+    # Keep the true totals; expand at most enough docs to fill k_docs.
+    docs_matching_all = len(occ_all)
+    occ = dict(sorted(occ_all.items(), key=lambda kv: -kv[1])[:400])
 
     docs: dict[int, dict] = {}
     for h in hits:
@@ -266,8 +287,14 @@ def coverage(db, embedder, query: str, k_docs: int = 15, chunk_pool: int = 120,
         if len(d["snippets"]) < 2:
             d["snippets"].append({"where": h["label"], "text": h["snippet"]})
 
-    # include docs that only the lexical census saw (beyond the chunk pool top hits)
-    for doc_id in set(occ) | set(concept):
+    # include docs that only the lexical census saw (beyond the chunk pool top
+    # hits) — bounded: strongest-occurrence candidates only, and only until
+    # the result set can fill k_docs (was O(corpus) snippet rescans)
+    extra_ids = sorted(set(occ) | set(concept),
+                       key=lambda d: -(occ.get(d, 0) + 2 * concept.get(d, 0)))
+    for doc_id in extra_ids:
+        if len(docs) >= k_docs:
+            break
         if doc_id not in docs:
             row = db.execute(
                 """SELECT title, folder, path, kind FROM docs WHERE id=? AND dup_of IS NULL""",
@@ -286,11 +313,24 @@ def coverage(db, embedder, query: str, k_docs: int = 15, chunk_pool: int = 120,
                 "snippets": [{"where": snippet_row["label"], "text": snippet_row["s"]}] if snippet_row else [],
             }
 
+    # exact per-doc occurrence counts for the (now bounded) candidate set —
+    # one grouped rescan instead of one rescan per doc
+    cand_ids = [d["doc_id"] for d in docs.values()]
+    if cand_ids:
+        ph = ",".join("?" * len(cand_ids))
+        exact_occ = {r["d"]: r["n"] for r in db.execute(
+            f"""SELECT c.doc_id AS d, COUNT(*) n FROM chunks_fts
+                JOIN chunks c ON c.id = chunks_fts.rowid
+                WHERE chunks_fts MATCH ? AND c.doc_id IN ({ph})
+                GROUP BY c.doc_id""", (q, *cand_ids)).fetchall()}
+    else:
+        exact_occ = {}
+
     out = []
     for d in docs.values():
         meta = db.execute(
             "SELECT pages, year, summary FROM docs WHERE id=?", (d["doc_id"],)).fetchone()
-        d["term_occurrences"] = occ.get(d["doc_id"], 0)
+        d["term_occurrences"] = exact_occ.get(d["doc_id"], 0)
         d["concept_chunks"] = concept.get(d["doc_id"], 0)
         pages = meta["pages"] or 1
         d["concept_density"] = round(d["concept_chunks"] / pages, 3)
@@ -305,12 +345,11 @@ def coverage(db, embedder, query: str, k_docs: int = 15, chunk_pool: int = 120,
         out.append(d)
 
     out.sort(key=lambda d: -d["rank_score"])
-    total_docs = len(out)
     total_hits = sum(d["term_occurrences"] for d in out)
     return {
         "query": query,
         "fts_expression": q,
-        "docs_matching": total_docs,
+        "docs_matching": docs_matching_all,
         "total_term_occurrences": total_hits,
         "documents": out[:k_docs],
         "note": "rank_score blends hybrid retrieval with concept_chunks (chunks containing ALL "
@@ -454,12 +493,19 @@ def related(db, embedder, doc_id: int, k: int = 8, exclude_roots: list[str] | No
     c = c / (np.linalg.norm(c) + 1e-9)
     pack = struct.pack(f"{len(c)}f", *c.tolist())
     rk, rargs = _rx("d", exclude_roots)
+    ann = db.execute(
+        "SELECT chunk_id, distance FROM vec_chunks WHERE embedding MATCH ? AND k = ?",
+        (pack, max(64, k * 12))).fetchall()
+    if not ann:
+        return []
+    dist = {int(a["chunk_id"]): a["distance"] for a in ann}
+    ph = ",".join("?" * len(dist))
     rows = db.execute(
-        f"""SELECT v.chunk_id, v.distance, c.doc_id, c.label, d.title, d.folder, d.kind,
-                  d.id AS did
-           FROM vec_chunks v JOIN chunks c ON c.id=v.chunk_id JOIN docs d ON d.id=c.doc_id
-           WHERE v.embedding MATCH ? AND k = ? AND d.dup_of IS NULL AND d.id != ? {rk}
-           ORDER BY v.distance""", (pack, max(64, k * 12), doc_id, *rargs)).fetchall()
+        f"""SELECT c.id AS chunk_id, c.doc_id, c.label, d.title, d.folder, d.kind
+            FROM chunks c JOIN docs d ON d.id=c.doc_id
+            WHERE c.id IN ({ph}) AND d.dup_of IS NULL AND d.id != ? {rk}""",
+        (*dist, doc_id, *rargs)).fetchall()
+    rows = sorted(rows, key=lambda r: dist[r["chunk_id"]])
     seen, out = set(), []
     for r in rows:
         if r["doc_id"] in seen:
@@ -467,7 +513,7 @@ def related(db, embedder, doc_id: int, k: int = 8, exclude_roots: list[str] | No
         seen.add(r["doc_id"])
         snip = _text_snippet(db, r["chunk_id"], [t for t in query_terms(doc_title(db, doc_id))][:4])
         out.append({"doc_id": r["doc_id"], "title": r["title"], "folder": r["folder"],
-                    "kind": r["kind"], "distance": round(r["distance"], 3),
+                    "kind": r["kind"], "distance": round(dist[r["chunk_id"]], 3),
                     "where": r["label"], "sample": snip[:300]})
         if len(out) >= k:
             break

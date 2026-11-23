@@ -57,11 +57,25 @@ def _excl(cfg: Config, args=None) -> list[str] | None:
     return cfg.disabled_roots or None
 
 
+def _graceful_ctrl_c():
+    """First Ctrl-C: stop the build cleanly (prune is skipped). Second: normal kill."""
+    import signal
+
+    from .ingest import GLOBAL_CANCEL
+
+    def handler(sig, frame):
+        GLOBAL_CANCEL.set()
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        print("\n!! stopping after current file (Ctrl-C again to force quit)", flush=True)
+    signal.signal(signal.SIGINT, handler)
+
+
 def cmd_sync(args):
     cfg = _cfg(args)
     if getattr(args, "ocr", False):
         cfg.ocr = True
     from .ingest import build_or_update
+    _graceful_ctrl_c()
     report: dict = {}
     build_or_update(cfg, report=report, retry_empty=getattr(args, "retry_empty", False))
     if args.json:
@@ -164,6 +178,7 @@ def cmd_build(args):
     if getattr(args, "ocr", False):
         cfg.ocr = True
     from .ingest import build_or_update
+    _graceful_ctrl_c()
     build_or_update(cfg, force=args.force, use_llm_summaries=args.llm, limit=args.limit,
                     retry_empty=getattr(args, "retry_empty", False))
 

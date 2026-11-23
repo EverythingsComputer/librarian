@@ -156,6 +156,17 @@ PYX
   run search "MMP-15 LT2-F Mini-CALIBER Table 3-1" --mode lexical > /dev/null \
     && echo "   hyphenated-model-number query survived (FTS quoting OK)" \
     || { echo "SMOKE FAIL: FTS crashed on hyphenated query"; exit 1; }
+  # regression (v0.2.9): an OFFLINE library root must never prune the index.
+  # (Incident: USB mount hiccup -> scan saw 0 files -> update_index deleted
+  # 2,501 rows that were all still on disk.)
+  mv "$T/docs" "$T/docs.offline"
+  run sync > "$T/offline-sync.log" 2>&1 || true
+  grep -q "prune skipped for unreadable root" "$T/offline-sync.log" \
+    || { echo "SMOKE FAIL: offline root did NOT trip the prune guard"; exit 1; }
+  run status | grep -q '"docs": 4' \
+    || { echo "SMOKE FAIL: index was pruned while root was offline"; exit 1; }
+  mv "$T/docs.offline" "$T/docs"
+  echo "   offline-root prune guard works (index survived a vanished root)"
   run status
   # double-click path: bare `ui` must come up, and a second bare `ui` must
   # slide to a free port instead of dying (v0.2.0 regression class).

@@ -133,6 +133,25 @@ model = "sentence-transformers/all-MiniLM-L6-v2"
         return [r.name for r in self.roots if not r.enabled]
 
 
+def set_ocr(cfg: Config, on: bool) -> None:
+    """Persist the OCR toggle into config.toml so the UI checkbox survives a
+    refresh and MCP `status` reports what indexing will actually do (v0.2.9 C2/C3:
+    the flag was per-request UI state only — status contradicted reality and a
+    page refresh re-checked the box while the job kept OCRing)."""
+    val = "true" if on else "false"
+    cfg_path = cfg.data_dir / "config.toml"
+    text = cfg_path.read_text() if cfg_path.exists() else Config.template()
+    m = re.search(r"(?m)^ocr\s*=.*$", text)
+    if m:
+        text = text[:m.start()] + f"ocr = {val}" + text[m.end():]
+    elif "[index]" in text:
+        text = text.replace("[index]", f"[index]\nocr = {val}", 1)
+    else:
+        text = text.rstrip("\n") + f"\n\n[index]\nocr = {val}\n"
+    cfg_path.write_text(text)
+    cfg.ocr = on
+
+
 def set_server_value(cfg: Config, key: str, value: str) -> None:
     """Set key = "value" in the [server] section of config.toml, creating the
     section/line if missing. Used by the UI's token manager."""
