@@ -96,8 +96,9 @@ INSTRUCTIONS_NOTE = "see server instructions"
 @mcp.tool()
 def status() -> str:
     """Index stats: doc/chunk counts, folders, last build time."""
+    from .config import Config
     from .ingest import status as _status
-    return _j(_status(cfg()))
+    return _j(_status(Config.load()))   # fresh: must reflect UI toggles made mid-session
 
 
 @mcp.tool()
@@ -177,13 +178,14 @@ def update_index() -> str:
     deletion (>25% of the library) is BLOCKED, not executed. If you (the agent)
     are running on a DIFFERENT machine than this server, never call this to
     'check' something — the server sees its own disks, you see none."""
+    from .config import Config
     from .ingest import SYNC_LOCK, GLOBAL_CANCEL, build_or_update
     if not SYNC_LOCK.acquire(blocking=False):
         return "a sync is already running; try again in a minute"
     GLOBAL_CANCEL.clear()
     try:
         rep: dict = {}
-        build_or_update(cfg(), report=rep, cancel=GLOBAL_CANCEL)
+        build_or_update(Config.load(), report=rep, cancel=GLOBAL_CANCEL)   # fresh roots/ocr
         return ("added=%s changed=%s removed=%s blocked=%s cancelled=%s docs=%s chunks=%s seconds=%s textless=%s"
                 % tuple(rep.get(k) for k in ("added", "changed", "removed", "prune_blocked",
                                              "cancelled", "docs", "chunks", "seconds", "textless")))
