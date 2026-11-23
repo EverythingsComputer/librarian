@@ -1,4 +1,4 @@
-"""Regression (v0.2.9, the Ebla-1 prune incident): an agent called
+"""Regression (v0.2.9, a 2026-11-22 production prune incident): an agent called
 update_index while the USB root was transiently unreadable; the scan yielded
 zero files, prune treated 2,501 existing rows as 'deleted', and the sync ran
 detached from the cancelled request, deleting past server shutdown.
