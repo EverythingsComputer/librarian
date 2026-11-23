@@ -475,9 +475,16 @@ def library(db, folder: str | None = None, limit: int = 400,
         f"""SELECT id, title, folder, kind, pages, year, substr(summary,1,140) summary
             FROM docs WHERE dup_of IS NULL {flt} {rk} ORDER BY root, folder, title LIMIT ?""",
         params + rargs + [limit]).fetchall()
+    total = db.execute(
+        f"""SELECT COUNT(*) c FROM docs WHERE dup_of IS NULL {flt} {rk}""",
+        params + rargs).fetchone()["c"]
     return {
         "folders": [dict(f) for f in folders],
+        "total_docs": total,
         "docs": [dict(d) for d in docs],
+        "note": (f"showing first {len(docs)} of {total} docs — use folder=<name> "
+                 "for a slice; do NOT re-call with a bigger limit, browse by folder")
+                if total > len(docs) else "",
     }
 
 

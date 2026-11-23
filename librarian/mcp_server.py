@@ -37,6 +37,10 @@ Cite documents by title + doc_id + page/slide label.
 Note: the user can switch individual library folders off (disable); switched-off
 folders are automatically excluded from every result — if the user mentions a
 folder that returns nothing, ask whether it is switched off.
+update_index() is the ONE mutating tool: it re-scans the server's own disks and
+can drop rows for files that are gone (with mass-deletion guardrails). Call it
+only when the user says files were added/changed/removed — never to "check"
+something, and remember the server sees its disks, not yours.
 """,
 )
 
@@ -102,9 +106,11 @@ def status() -> str:
 
 
 @mcp.tool()
-def library(folder: str | None = None, limit: int = 300) -> str:
+def library(folder: str | None = None, limit: int = 150) -> str:
     """Map of the library: folders with doc counts + doc cards (id/title/summary).
-    Call once per session before broad questions. folder: filter by name fragment."""
+    Call once per session before broad questions. folder: filter by name fragment.
+    With many docs the card list is capped (total_docs says the real size) —
+    drill into one folder instead of raising limit."""
     return _j(S.library(db(), folder=folder, limit=limit, exclude_roots=_excl()))
 
 
