@@ -267,12 +267,14 @@ def api_state(cfg: Config) -> dict:
                                      "missing": True})
     db.close()
     from .extract import tool_path, tessdata_dir
+    from .ingest import progress_snapshot
     out.update(last_sync=time.strftime("%Y-%m-%d %H:%M", time.localtime(float(row["v"] or 0))) if row else "",
                total_docs=total, duplicates=dups, searchable=searchable,
                textless=textless,
                tools={n: bool(tool_path(n)) for n in ("pdftotext", "pdfinfo")},
                ocr={"enabled": bool(cfg.ocr),
                     "available": bool(tool_path("tesseract") and tool_path("pdftoppm"))},
+               sync=progress_snapshot(),
                db_mb=round(cfg.db_path.stat().st_size / 1e6, 1))
     return out
 
@@ -392,6 +394,9 @@ async function refresh(){
  $('stats').textContent=s.indexed?
   `${s.searchable} of ${s.total_docs} documents searchable · last checked ${s.last_sync} · index ${s.db_mb} MB`:
   'not indexed yet — add a folder and press “Check for new files”';
+ if(s.sync&&s.sync.active){ // sync running (started here or before a reload)
+  $('sync').disabled=true;_extinct=true;prog(true);
+  $('msg').textContent=`syncing ${s.sync.done}/${s.sync.total}: ${s.sync.file||s.sync.detail||''} (${s.sync.file_seconds||0}s on this file)`;}
  const oc=$('ocr');
  if(!oc.dataset.init&&s.ocr){oc.checked=!!s.ocr.enabled;oc.dataset.init='1';
   if(!s.ocr.available){oc.disabled=true;oc.parentElement.title='tesseract is not available on this machine';oc.parentElement.style.opacity=.55;}}
@@ -408,14 +413,19 @@ async function refresh(){
   <div class="cnt">${l.docs} docs</div>
   <button class="del" onclick="del('${esc(l.name)}')">Remove</button></div>`).join('')||'<i>No folders yet</i>';
 }
-async function sync(){ $('sync').disabled=true;$('msg').className='';$('msg').textContent='checking…';
+let _pp=null,_extinct=false;
+function prog(on){ if(on){ if(_pp)return; _pp=setInterval(async()=>{try{const s=await j('/api/state');
+  if(s.sync&&s.sync.active){$('msg').textContent=`syncing ${s.sync.done}/${s.sync.total}: ${s.sync.file||s.sync.detail||''} (${s.sync.file_seconds||0}s on this file)`;}
+  else if(_extinct){prog(false);$('sync').disabled=false;refresh();}
+ }catch(e){}},2500);} else {clearInterval(_pp);_pp=null;} }
+async function sync(){ $('sync').disabled=true;$('msg').className='';$('msg').textContent='checking…';_extinct=false;prog(true);
  try{const d=await j('/api/sync',{ocr:$('ocr').checked});$('msg').textContent=d.summary||(d.busy?d.message:'done')}
  catch(e){$('msg').className='err';$('msg').textContent=''+e}
- $('sync').disabled=false;refresh()}
-async function retryEmpty(){ $('sync').disabled=true;$('msg').textContent='retrying files with no text…';
+ prog(false);$('sync').disabled=false;refresh()}
+async function retryEmpty(){ $('sync').disabled=true;$('msg').textContent='retrying files with no text…';_extinct=false;prog(true);
  try{const d=await j('/api/sync',{retry:true,ocr:$('ocr').checked});$('msg').textContent=d.summary||'done'}
  catch(e){$('msg').className='err';$('msg').textContent=''+e}
- $('sync').disabled=false;refresh()}
+ prog(false);$('sync').disabled=false;refresh()}
 async function toggle(n,on){try{await j('/api/toggle',{name:n,enabled:on});refresh()}catch(e){alert(e)}}
 async function addFolder(){const p=$('newpath').value.trim();if(!p)return;
  $('msg').textContent='adding + indexing…';

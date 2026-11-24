@@ -190,6 +190,29 @@ class PruneSafetyTests(unittest.TestCase):
         self.assertEqual(title, correct)
         self.assertEqual(fts_title, correct)
 
+    def test_progress_reports_current_file(self):
+        import librarian.ingest as I
+        p = self.dd / "lib" / "slow.txt"
+        _make_txt(p, "hello world, some real content here")
+        seen = {}
+        orig = I._ingest_one
+
+        def spy(db, cfg, probe, llm, path, *a, **k):
+            p = I.progress_snapshot()
+            seen["file"] = p["file"]
+            seen["active"] = p["active"]
+            seen["pos"] = (p["done"], p["total"])
+            return orig(db, cfg, probe, llm, path, *a, **k)
+        I._ingest_one = spy
+        try:
+            build_or_update(self.cfg, report={})
+        finally:
+            I._ingest_one = orig
+        self.assertEqual(seen["file"], "slow.txt")   # visible WHILE working on it
+        self.assertTrue(seen["active"])
+        self.assertEqual(seen["pos"], (1, 1))
+        self.assertFalse(I.progress_snapshot()["active"])   # cleared when done
+
 
 class MojibakeTests(unittest.TestCase):
     def test_arabic_double_decode(self):

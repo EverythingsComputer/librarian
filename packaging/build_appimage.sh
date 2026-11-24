@@ -137,7 +137,10 @@ d.output(os.path.join(T, "docs", "scan-only.pdf"))
 PYX
   run init
   run add-folder "$T/docs"
-  run sync --ocr
+  run sync --ocr > "$T/sync1.log" 2>&1 || { cat "$T/sync1.log"; exit 1; }
+  grep -q '^> \[1/' "$T/sync1.log" \
+    || { echo "SMOKE FAIL: no per-file 'current file' progress lines in sync log"; exit 1; }
+  echo "   per-file progress lines present (current file visible during long OCR)"
   echo "-- find:"; run find "4200"
   # assert on signals only a WORKING extractor + OCR can produce: zero
   # textless docs, and BOTH PDFs carrying page labels

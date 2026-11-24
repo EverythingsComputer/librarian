@@ -28,6 +28,24 @@ SYNC_LOCK = threading.Lock()
 # the server kept deleting rows through 'Finished server process').
 GLOBAL_CANCEL = threading.Event()
 
+# live view of the current build, readable by the UI /api/state and MCP
+# status while the sync request itself is still blocking (v0.2.13: long OCR
+# runs went silent for minutes per file with no way to see the current one)
+PROGRESS = {"active": False, "done": 0, "total": 0, "file": "", "detail": "",
+            "started": 0.0, "file_started": 0.0}
+
+
+def _progress(**kw):
+    global PROGRESS
+    PROGRESS = {**PROGRESS, **kw}
+
+
+def progress_snapshot() -> dict:
+    p = dict(PROGRESS)
+    if p.get("active"):
+        p["file_seconds"] = round(time.time() - (p["file_started"] or p["started"] or time.time()))
+    return p
+
 
 def install_shutdown_hook(app):
     """Starlette/uvicorn apps call this so server shutdown stops an in-flight
@@ -248,12 +266,20 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
     t0 = time.time()
     done = 0
     cancelled = False
+    _progress(active=True, done=0, total=total, file="", detail="", started=t0)
     for kind, p in plans:
         if cancel.is_set():
             cancelled = True
             print(f"!! cancelled after {done}/{total} files — nothing pruned; re-run sync to continue")
             break
         done += 1
+        # announce BEFORE the work: while a 400-page scan OCRs for minutes,
+        # the terminal/last log line always names the file being worked on
+        sz = p.stat().st_size / 1e6 if p.exists() else 0
+        _progress(done=done, file=p.name,
+                  detail=f"{kind} {sz:.1f} MB" + (" +OCR" if cfg.ocr and p.suffix.lower() == ".pdf" else ""))
+        print(f"> [{done}/{total}] {p.name} ({kind}, {sz:.1f} MB)", flush=True)
+        file_t0 = time.time()
         root_name = next((r.name for r in cfg.roots if str(p).startswith(str(r.path))), "")
         rel = p.relative_to(next(r.path for r in cfg.roots if str(p).startswith(str(r.path))))
         folder = str(rel.parent) if str(rel.parent) != "." else "/"
@@ -264,12 +290,16 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
         except Exception as e:
             print(f"!! failed {p}: {type(e).__name__}: {e}")
             _insert_broken(db, p, root_name, folder, f"extraction error: {e}")
+        fel = time.time() - file_t0
+        if fel > 15:   # call out the slow ones so the pace is obvious
+            print(f"   ^ finished in {fel:.0f}s", flush=True)
         if done % 25 == 0 or done == total:
             el = time.time() - t0
             print(f"  [{done}/{total}] {el:.0f}s elapsed, {p.name[:60]}")
             db.commit()
 
     # ---- guarded prune (v0.2.9) ------------------------------------------------
+    _progress(active=True, file="", detail="pruning")
     if cancel.is_set():
         cancelled = True          # may have been set before/after the loop too
     # Rules learned from the incident where a transiently-unreadable USB root
@@ -331,6 +361,7 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
     elapsed = time.time() - t0
     print(f"done: {n_docs} docs, {n_chunks} chunks, {elapsed:.0f}s, db={cfg.db_path} "
           f"({cfg.db_path.stat().st_size/1e6:.0f} MB)")
+    _progress(active=False, done=total if not cancelled else done, file="", detail="")
     if report is not None:
         report.update(
             added=sum(1 for k, _ in plans if k == "new"),
@@ -537,6 +568,7 @@ def status(cfg: Config) -> dict:
         "textless": db.execute(
             "SELECT COUNT(*) c FROM docs WHERE kind='empty' AND dup_of IS NULL").fetchone()["c"],
         "tools": {n: tool_path(n) for n in ("pdftotext", "pdfinfo", "pdftoppm", "tesseract")},
+        "sync": progress_snapshot(),
         "ocr": {"enabled": bool(cfg.ocr), "available": X.ocr_available(),
                 "tesseract": tool_path("tesseract"),
                 "tessdata": X.tessdata_dir()},
