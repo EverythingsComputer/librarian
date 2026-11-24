@@ -229,8 +229,12 @@ def _serve_invocation() -> str:
 
 def api_state(cfg: Config) -> dict:
     from .db import connect
-    out = {"libraries": [], "indexed": cfg.db_path.exists()}
+    from .ingest import progress_snapshot
+    out = {"libraries": [], "indexed": cfg.db_path.exists(),
+           "sync": progress_snapshot()}
     if not out["indexed"]:
+        # no db yet — but a FIRST build may be running right now; progress
+        # matters most then, so sync is already in `out`
         out["libraries"] = [{"name": r.name, "path": str(r.path), "enabled": r.enabled,
                              "docs": 0} for r in cfg.roots]
         return out
