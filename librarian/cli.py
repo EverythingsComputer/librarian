@@ -153,6 +153,51 @@ def cmd_toggle(args, enable: bool):
     print(f"{root.name}: {state}")
 
 
+def cmd_profile(args):
+    """Shared-access profile management (v0.3.0)."""
+    from .config import (add_profile, delete_profile, find_profile,
+                         rename_profile, reset_profile_token,
+                         set_profile_enabled, set_profile_roots)
+    cfg = _cfg(args)
+    act = args.action
+
+    def roots_list(s: str) -> list[str]:
+        return [x.strip() for x in s.split(",") if x.strip()]
+
+    try:
+        if act == "list":
+            if not cfg.profiles:
+                print("no profiles yet — create one:  librarian profile add <name> --roots <folders>")
+                return
+            for p in cfg.profiles:
+                state = "on " if p.enabled else "OFF"
+                print(f"[{state}] {p.name}: {', '.join(p.roots) or '(nothing granted)'}")
+        elif act == "add":
+            prof, plain = add_profile(cfg, args.name,
+                                      roots_list(args.roots or ""))
+            print(f"profile '{prof.name}' -> folders: {', '.join(prof.roots) or '(none yet)'}")
+            print("ACCESS TOKEN (shown ONCE, give it to this person): " + plain)
+            print("connect string:  <server URL>?token=<that token>")
+        elif act == "rename":
+            prof = rename_profile(cfg, args.name, args.new)
+            print(f"renamed to '{prof.name}'")
+        elif act == "rm":
+            prof = delete_profile(cfg, args.name)
+            print(f"profile '{prof.name}' deleted; its token no longer works")
+        elif act == "token":
+            plain = reset_profile_token(cfg, args.name)
+            print(f"new token for '{args.name}' (shown ONCE; old one is dead): " + plain)
+        elif act == "roots":
+            prof = set_profile_roots(cfg, args.name, roots_list(args.set or ""))
+            print(f"'{prof.name}' can now see: {', '.join(prof.roots) or '(nothing)'}")
+        elif act in ("enable", "disable"):
+            prof = set_profile_enabled(cfg, args.name, act == "enable")
+            print(f"'{prof.name}' " + ("enabled — token works again"
+                                       if prof.enabled else "disabled — token rejected (profile kept)"))
+    except ValueError as e:
+        sys.exit(f"error: {e}")
+
+
 def cmd_ui(args):
     from .ui import DEFAULT_PORT, serve
     cfg = _cfg(args)
@@ -384,6 +429,27 @@ def main(argv=None):
     p = sub.add_parser("disable", parents=[common], help="hide a library folder from search (keeps index)")
     p.add_argument("name")
     p.set_defaults(fn=lambda a: cmd_toggle(a, False))
+
+    # --- shared-access profiles (v0.3.0)
+    pp = sub.add_parser("profile", parents=[common],
+                        help="shared MCP access: named tokens scoped to chosen library folders")
+    pa = pp.add_subparsers(dest="action", required=True)
+    pa.add_parser("list", parents=[common])
+    x = pa.add_parser("add", parents=[common], help="create a profile; its token is printed ONCE")
+    x.add_argument("name")
+    x.add_argument("--roots", default="", help="comma-separated library folder names it may see")
+    x = pa.add_parser("rename", parents=[common])
+    x.add_argument("name"); x.add_argument("new")
+    x = pa.add_parser("rm", parents=[common], help="delete a profile (its token stops working)")
+    x.add_argument("name")
+    x = pa.add_parser("token", parents=[common], help="reset a profile's token (old one dies now)")
+    x.add_argument("name")
+    x = pa.add_parser("roots", parents=[common], help="change which folders a profile sees")
+    x.add_argument("name"); x.add_argument("--set", required=True, help="comma-separated folder names")
+    x = pa.add_parser("enable", parents=[common]); x.add_argument("name")
+    x = pa.add_parser("disable", parents=[common]); x.add_argument("name")
+    for _x in pa.choices.values():
+        _x.set_defaults(fn=cmd_profile)
     p = sub.add_parser("ui", parents=[common], help="local web page for maintenance + search")
     p.add_argument("--port", type=int, default=None,
                    help="default: 8765; if busy the default launch uses the next free port")

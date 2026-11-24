@@ -40,6 +40,43 @@ class LibraryRoot:
 
 
 @dataclass
+class Profile:
+    """A shared-access identity for the MCP server (v0.3.0).
+
+    Each profile sees ONLY the library roots named in `roots`. The client
+    authenticates with a token whose SHA-256 hash is stored in `token_hash`
+    ("sha256:<hex>"); the plaintext is shown once at create/reset and never
+    stored. The admin's master token ([server] mcp_token) is not a profile
+    and sees everything.
+    """
+    name: str
+    token_hash: str
+    roots: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+
+def gen_token() -> str:
+    import secrets
+    return secrets.token_urlsafe(24)
+
+
+def hash_token(plain: str) -> str:
+    import hashlib
+    return "sha256:" + hashlib.sha256(plain.encode()).hexdigest()
+
+
+def token_matches(stored: str, provided: str) -> bool:
+    """Constant-time compare; understands 'sha256:<hex>' storage format and
+    plain values (the legacy master token is stored plaintext, as before)."""
+    import hmac
+    if not stored or not provided:
+        return False
+    if stored.startswith("sha256:"):
+        return hmac.compare_digest(stored, hash_token(provided))
+    return hmac.compare_digest(stored, provided)
+
+
+@dataclass
 class Config:
     data_dir: Path
     db_path: Path
@@ -56,6 +93,7 @@ class Config:
     index_archives: bool = False
     mcp_port: int = 8770              # default port for `librarian mcp-serve --transport http`
     mcp_token: str = ""               # bearer token; mcp-serve uses it when --token is omitted
+    profiles: list[Profile] = field(default_factory=list)   # shared-access tokens (v0.3.0)
 
     @classmethod
     def load(cls, data_dir: Path | None = None) -> "Config":
@@ -93,6 +131,11 @@ class Config:
             index_archives=bool(idx.get("index_archives", False)),
             mcp_port=int(srv.get("mcp_port", 8770)),
             mcp_token=str(srv.get("mcp_token", "")),
+            profiles=[Profile(name=str(p.get("name") or f"profile{i}"),
+                              token_hash=str(p.get("token") or ""),
+                              roots=[str(x) for x in p.get("roots", [])],
+                              enabled=bool(p.get("enabled", True)))
+                      for i, p in enumerate(raw.get("profile", []))],
         )
 
     @staticmethod
@@ -124,6 +167,11 @@ model = "sentence-transformers/all-MiniLM-L6-v2"
 [server]               # `librarian mcp-serve --transport http` defaults
 # mcp_port = 8770
 # mcp_token = "long-r…dom"   # required for non-loopback binds; shown in the web UI
+
+# [[profile]]              # shared access (v0.3.0): per-token view of the library.
+# name = "friend-1"        # create with `librarian profile add` or the web UI —
+# token = "sha256:..."     # never hand-edit: the token plaintext is shown ONCE
+# roots = ["Chemistry"]    # library folder names this profile can see
 """
 
 
@@ -279,3 +327,152 @@ def find_root(cfg: Config, name: str) -> LibraryRoot:
             return r
     known = ", ".join(r.name for r in cfg.roots) or "(none)"
     raise ValueError(f"no library named '{name}'. Known libraries: {known}")
+
+
+# ------------------------------------------------------------------- profiles
+# [[profile]] blocks are written like [[library]] ones: regenerate only that
+# contiguous region, keep every other line byte-for-byte; append at EOF when
+# no blocks exist yet (always valid TOML).
+
+_PRO_HEADER = "[[profile]]"
+
+
+def _profiles_region(text: str) -> tuple[int, int]:
+    lines = text.splitlines(keepends=True)
+    idx = [i for i, l in enumerate(lines) if l.strip() == _PRO_HEADER]
+    if not idx:
+        return -1, -1
+    start, last = idx[0], idx[-1]
+    for i in range(start, last):
+        s = lines[i].strip()
+        if s.startswith("[") and s != _PRO_HEADER:
+            raise ValueError("config.toml has other sections mixed between [[profile]] "
+                             "blocks; move all profile blocks together, then retry")
+    end = last + 1
+    for i in range(end, len(lines)):
+        if lines[i].strip().startswith("["):
+            break
+        end = i + 1
+    return (sum(map(len, lines[:start])), sum(map(len, lines[:end])))
+
+
+def _render_profiles(profiles: list[Profile]) -> str:
+    out = []
+    for p in profiles:
+        out.append(f"{_PRO_HEADER}\nname = \"{p.name}\"\ntoken = \"{p.token_hash}\"\n")
+        items = ", ".join(f'"{r}"' for r in p.roots)
+        out.append(f"roots = [{items}]\n")
+        if not p.enabled:
+            out.append("enabled = false   # switched off: token rejected, kept for later\n")
+        out.append("\n")
+    return "".join(out).rstrip("\n") + "\n"
+
+
+def write_profiles(cfg: Config, profiles: list[Profile]) -> None:
+    cfg_path = cfg.data_dir / "config.toml"
+    text = cfg_path.read_text() if cfg_path.exists() else ""
+    start, end = _profiles_region(text)
+    block = _render_profiles(profiles)
+    if start < 0:
+        if profiles:
+            text = text.rstrip("\n") + ("\n\n# Shared-access profiles (UI -> 'Shared access', or"
+                                        " `librarian profile add`)\n" + block)
+    else:
+        if profiles:
+            text = text[:start] + block + "\n" + text[end:].lstrip("\n")
+        else:
+            # removed the last profile: drop the region + the generated comment line
+            head = text[:start].rstrip("\n")
+            m = re.search(r"\n# Shared-access profiles[^\n]*$", head)
+            if m:
+                head = head[:m.start()]
+            text = head + "\n" + text[end:].lstrip("\n")
+    cfg_path.write_text(text)
+    try:
+        cfg_path.chmod(0o600)
+    except OSError:
+        pass
+    cfg.profiles = profiles
+
+
+def find_profile(cfg: Config, name: str) -> Profile:
+    low = name.strip().lower()
+    for p in cfg.profiles:
+        if p.name.lower() == low:
+            return p
+    known = ", ".join(p.name for p in cfg.profiles) or "(none)"
+    raise ValueError(f"no profile named '{name}'. Known profiles: {known}")
+
+
+def _validate_profile_roots(cfg: Config, root_names: list[str]) -> list[str]:
+    """Accept only library-folder names that exist right now (typo guard at
+    creation; stale names later just grant nothing). Case is normalized to
+    the configured root's exact spelling."""
+    by_low = {r.name.lower(): r.name for r in cfg.roots}
+    out = []
+    for n in root_names:
+        key = n.strip().lower()
+        if not key:
+            continue
+        if key not in by_low:
+            known = ", ".join(r.name for r in cfg.roots) or "(none)"
+            raise ValueError(f"no library folder named '{n}'. Known folders: {known}")
+        if by_low[key] not in out:
+            out.append(by_low[key])
+    return out
+
+
+def add_profile(cfg: Config, name: str, root_names: list[str]) -> tuple[Profile, str]:
+    """Create a profile; returns (profile, PLAINTEXT TOKEN — shown once)."""
+    nm = name.strip()
+    if not nm:
+        raise ValueError("profile name required")
+    if any(p.name.lower() == nm.lower() for p in cfg.profiles):
+        raise ValueError(f"profile '{nm}' already exists")
+    roots = _validate_profile_roots(cfg, root_names)
+    plain = gen_token()
+    prof = Profile(name=nm, token_hash=hash_token(plain), roots=roots)
+    write_profiles(cfg, [*cfg.profiles, prof])
+    return prof, plain
+
+
+def reset_profile_token(cfg: Config, name: str) -> str:
+    """Rotate a profile's token; old token dies immediately. Returns the new
+    PLAINTEXT token (shown once)."""
+    prof = find_profile(cfg, name)
+    plain = gen_token()
+    prof.token_hash = hash_token(plain)
+    write_profiles(cfg, cfg.profiles)
+    return plain
+
+
+def rename_profile(cfg: Config, old: str, new: str) -> Profile:
+    prof = find_profile(cfg, old)
+    nm = new.strip()
+    if not nm:
+        raise ValueError("profile name required")
+    if nm.lower() != prof.name.lower() and any(p.name.lower() == nm.lower() for p in cfg.profiles):
+        raise ValueError(f"profile '{nm}' already exists")
+    prof.name = nm
+    write_profiles(cfg, cfg.profiles)
+    return prof
+
+
+def delete_profile(cfg: Config, name: str) -> Profile:
+    prof = find_profile(cfg, name)
+    write_profiles(cfg, [p for p in cfg.profiles if p.name != prof.name])
+    return prof
+
+
+def set_profile_enabled(cfg: Config, name: str, enabled: bool) -> Profile:
+    prof = find_profile(cfg, name)
+    prof.enabled = enabled
+    write_profiles(cfg, cfg.profiles)
+    return prof
+
+
+def set_profile_roots(cfg: Config, name: str, root_names: list[str]) -> Profile:
+    prof = find_profile(cfg, name)
+    prof.roots = _validate_profile_roots(cfg, root_names)
+    write_profiles(cfg, cfg.profiles)
+    return prof

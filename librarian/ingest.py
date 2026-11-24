@@ -548,12 +548,21 @@ def _vacuum_if_needed(db, cfg):
     db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
 
-def status(cfg: Config) -> dict:
+def status(cfg: Config, exclude_roots: list[str] | None = None) -> dict:
+    """Index stats. exclude_roots (v0.3.0): when answering a shared-access
+    PROFILE, hide the folders the profile cannot see — counts and folder map
+    must not leak the existence of other libraries."""
     import json
     from .extract import tool_path
     if not cfg.db_path.exists():
         return {"indexed": False, "db": str(cfg.db_path)}
     db = connect(cfg.db_path, read_only=True)
+    excl = [e for e in (exclude_roots or [])]
+    rcond = ""
+    rargs: list = []
+    if excl:
+        rcond = " AND (root IS NULL OR root NOT IN (" + ",".join("?" * len(excl)) + "))"
+        rargs = list(excl)
 
     def meta_val(key, default=None):
         row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -563,22 +572,35 @@ def status(cfg: Config) -> dict:
         "indexed": True,
         "db": str(cfg.db_path),
         "db_mb": round(cfg.db_path.stat().st_size / 1e6, 1),
-        "docs": db.execute("SELECT COUNT(*) c FROM docs").fetchone()["c"],
-        "with_text": db.execute("SELECT COUNT(*) c FROM docs WHERE chars>0").fetchone()["c"],
+        "docs": db.execute(f"SELECT COUNT(*) c FROM docs WHERE 1=1{rcond}", rargs).fetchone()["c"],
+        "with_text": db.execute(
+            f"SELECT COUNT(*) c FROM docs WHERE chars>0{rcond}", rargs).fetchone()["c"],
         "textless": db.execute(
-            "SELECT COUNT(*) c FROM docs WHERE kind='empty' AND dup_of IS NULL").fetchone()["c"],
+            f"SELECT COUNT(*) c FROM docs WHERE kind='empty' AND dup_of IS NULL{rcond}",
+            rargs).fetchone()["c"],
         "tools": {n: tool_path(n) for n in ("pdftotext", "pdfinfo", "pdftoppm", "tesseract")},
         "sync": progress_snapshot(),
         "ocr": {"enabled": bool(cfg.ocr), "available": X.ocr_available(),
                 "tesseract": tool_path("tesseract"),
                 "tessdata": X.tessdata_dir()},
-        "duplicates": db.execute("SELECT COUNT(*) c FROM docs WHERE dup_of IS NOT NULL").fetchone()["c"],
-        "chunks": db.execute("SELECT COUNT(*) c FROM chunks").fetchone()["c"],
+        "duplicates": db.execute(
+            f"SELECT COUNT(*) c FROM docs WHERE dup_of IS NOT NULL{rcond}", rargs).fetchone()["c"],
+        "chunks": db.execute(
+            "SELECT COUNT(*) c FROM chunks WHERE doc_id IN (SELECT id FROM docs WHERE 1=1"
+            + rcond + ")", rargs).fetchone()["c"] if excl
+            else db.execute("SELECT COUNT(*) c FROM chunks").fetchone()["c"],
         "dims": int(meta_val("dims", 0)),
         "last_build": float(meta_val("last_build", 0) or 0),
-        "roots": json.loads(meta_val("roots", "[]")),
+        "roots": [r for r in json.loads(meta_val("roots", "[]"))
+                  if not excl or _root_name(r) not in excl],
         "folders": [dict(r) for r in db.execute(
-            "SELECT folder, COUNT(*) c FROM docs WHERE dup_of IS NULL GROUP BY folder ORDER BY c DESC LIMIT 40")],
+            "SELECT folder, COUNT(*) c FROM docs WHERE dup_of IS NULL"
+            + rcond + " GROUP BY folder ORDER BY c DESC LIMIT 40", rargs)],
     }
     db.close()
     return out
+
+
+def _root_name(r) -> str:
+    """meta['roots'] entries are dicts ({'name':...}) or plain strings."""
+    return r.get("name", "") if isinstance(r, dict) else str(r)

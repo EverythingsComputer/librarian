@@ -37,6 +37,9 @@ Cite documents by title + doc_id + page/slide label.
 Note: the user can switch individual library folders off (disable); switched-off
 folders are automatically excluded from every result — if the user mentions a
 folder that returns nothing, ask whether it is switched off.
+If your access token is a SHARED PROFILE, you see only the library folders it
+was granted: they are ALL the folders that exist *for you* — do not assume
+anything else exists, and never conclude 'missing' from that view.
 update_index() is the ONE mutating tool: it re-scans the server's own disks and
 can drop rows for files that are gone (with mass-deletion guardrails). Call it
 only when the user says files were added/changed/removed — never to "check"
@@ -88,10 +91,36 @@ def _j(obj) -> str:
 
 
 def _excl() -> list[str] | None:
-    """Library folders the user switched off — hidden from every query.
-    Re-reads config.toml each call so UI/CLI toggles apply without a restart."""
+    """Library folders hidden from this request: the ones the user switched
+    off, PLUS — when the credential is a shared-access PROFILE — every folder
+    the profile was not granted. Re-reads config.toml each call so UI/CLI
+    edits apply without a restart."""
+    from .access import CURRENT, excluded_roots
     from .config import Config
-    return Config.load(cfg().data_dir).disabled_roots or None
+    return excluded_roots(Config.load(cfg().data_dir), CURRENT.get())
+
+
+def _profile() -> bool:
+    from .access import CURRENT
+    return CURRENT.get() is not None
+
+
+def _doc_guard(doc_id: int) -> str | None:
+    """For ID-based tools: a profile may only reach documents whose library
+    folder it was granted. Admin sees everything except disabled folders."""
+    from .access import CURRENT, doc_root, visible_root
+    prof = CURRENT.get()
+    if prof is None:
+        return None
+    root = doc_root(db(), doc_id)
+    if root is False:
+        return None                      # unknown id: the tool's own error path
+    from .config import Config
+    if not visible_root(Config.load(cfg().data_dir), prof, root):
+        return _j({"error": "document not in your profile",
+                   "note": "your token grants access to a fixed set of library "
+                           "folders; this document lives outside them"})
+    return None
 
 
 INSTRUCTIONS_NOTE = "see server instructions"
@@ -104,7 +133,7 @@ def status() -> str:
     current file, seconds on it)."""
     from .config import Config
     from .ingest import status as _status
-    return _j(_status(Config.load()))   # fresh: must reflect UI toggles made mid-session
+    return _j(_status(Config.load(), exclude_roots=_excl()))   # fresh + profile-scoped
 
 
 @mcp.tool()
@@ -156,6 +185,9 @@ def find_term(term: str) -> str:
 @mcp.tool()
 def doc_card(doc_id: int) -> str:
     """One document: metadata, summary, note (duplicates/video link), section outline."""
+    deny = _doc_guard(doc_id)
+    if deny:
+        return deny
     return _j(S.doc_card(db(), doc_id))
 
 
@@ -167,12 +199,18 @@ def read_doc(doc_id: int, label_contains: str | None = None, max_chars: int = 24
     label_contains selects pages whose label matches ('p.24' matches 'p.24 (cont 1)');
     if nothing matches you get an error listing real labels — never put product names
     or body text in it, that is search()'s job."""
+    deny = _doc_guard(doc_id)
+    if deny:
+        return deny
     return _j(S.read_doc(db(), doc_id, label_contains=label_contains, max_chars=max_chars))
 
 
 @mcp.tool()
 def related(doc_id: int, k: int = 8) -> str:
     """Documents nearest to this one in meaning — good for following a thread across files."""
+    deny = _doc_guard(doc_id)
+    if deny:
+        return deny
     return _j(S.related(db(), embedder(), doc_id, k=k, exclude_roots=_excl()))
 
 
@@ -185,7 +223,12 @@ def update_index() -> str:
     that scans as empty is treated as an offline mount (protected), and a mass
     deletion (>25% of the library) is BLOCKED, not executed. If you (the agent)
     are running on a DIFFERENT machine than this server, never call this to
-    'check' something — the server sees its own disks, you see none."""
+    'check' something — the server sees its own disks, you see none.
+    ADMIN ONLY: shared-access profiles cannot call this (and it is hidden
+    from their tool list)."""
+    if _profile():
+        return ("error: update_index requires the admin token. Shared profiles "
+                "are read-only; ask the library owner to run the sync.")
     from .config import Config
     from .ingest import SYNC_LOCK, GLOBAL_CANCEL, build_or_update
     if not SYNC_LOCK.acquire(blocking=False):

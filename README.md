@@ -144,13 +144,42 @@ Over [Tailscale](https://tailscale.com) (a free private network),
 `<this-machine-ip>` is the machine's `100.x.y.z` address — the web page
 shows it under "This machine on Tailscale".
 
+## Sharing parts of your library (profiles)
+
+The token above is the **admin** token: full access to every folder. To give
+a friend, colleague, or another agent access to only *some* of your library,
+create a **profile**: a named, per-person token that can only see the folders
+you check.
+
+- Web page → **Shared access** → name the profile, tick the folders →
+  **Create**. The token is shown **once** — only a hash is stored, so if it's
+  lost, press "new token" (the old one dies immediately).
+- Or from a terminal:
+
+  ```bash
+  librarian profile add friend-1 --roots "Chemistry,Historical"   # prints the token once
+  librarian profile list
+  librarian profile roots friend-1 --set "Chemistry"   # change what it sees
+  librarian profile token friend-1                     # reset (old token dies now)
+  librarian profile disable friend-1                   # block without deleting
+  librarian profile rm friend-1                        # revoke for good
+  ```
+
+The recipient uses the **same URL** as step 3, with their own token. They see
+only their granted folders — in search results, counts, the folder map, and
+by document ID. Everything else is invisible, not merely filtered. Profiles
+are **read-only**: the one mutating tool (`update_index`) is admin-only and
+hidden from a profile's tool list entirely. Changes apply to the running
+server immediately — no restart, and other clients' tokens are unaffected.
+
 Security notes, in plain terms: the web page is reachable only from the
-machine it runs on, by design, because it can display the token. The MCP
-server is the only part that accepts network connections; it refuses to start
-on a network address without a token, and that one shared token is the only
-thing standing between the network and your documents. Keep it on a private
-network. Do not expose it to the open internet without a proper HTTPS proxy
-with its own protections in front.
+machine it runs on, by design, because it can display the admin token and
+manage profiles. The MCP server is the only part that accepts network
+connections; it refuses to start on a network address without a credential,
+and every request must present either the admin token or a valid profile
+token. Tokens travel in plain HTTP, so keep this on a private network
+(Tailscale) or behind an HTTPS proxy with its own protections in front —
+a token is then equivalent to a password you cannot see once handed out.
 
 ## Settings
 
@@ -170,7 +199,7 @@ new machine: install there, copy the settings file (not the index), run
 
 | Command | What it does |
 |---|---|
-| `librarian ui` | local web page: search, sync, folders, token |
+| `librarian ui` | local web page: search, sync, folders, tokens, shared access |
 | `librarian sync` | index new files, forget deleted ones |
 | `librarian search "words"` | combined word + meaning search |
 | `librarian coverage "topic"` | every document touching a topic, with counts |
@@ -199,8 +228,10 @@ searchable; PDFs with no readable text are reported, never silently skipped.
 - Linux only for now. The pieces are standard Python, but Windows and macOS
   have not been tested.
 - `.msg` emails that are encrypted or signed-only may yield no text.
-- The networked MCP server has one shared token: no per-device keys, no rate
-  limiting, no built-in HTTPS (see security notes above).
+- The networked MCP server authenticates bearer tokens (admin + per-profile,
+  v0.3.0): there is no rate limiting, no user accounts behind the tokens, and
+  no built-in HTTPS (see security notes above). A token is a bearer secret —
+  whoever holds it holds the access.
 
 ## License
 

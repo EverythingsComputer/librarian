@@ -170,6 +170,111 @@ PYX
     || { echo "SMOKE FAIL: index was pruned while root was offline"; exit 1; }
   mv "$T/docs.offline" "$T/docs"
   echo "   offline-root prune guard works (index survived a vanished root)"
+
+  # ---- v0.3.0 shared-access profiles: THE enforcement gate. The shipped
+  # artifact must scope every MCP answer to the caller's token over real
+  # wire: invisible folders, denied doc IDs, hidden mutating tool, 401s.
+  # (A leak here is a privacy incident, so this is a release blocker.)
+  echo "-- profiles:"
+  mkdir -p "$T/pa" "$T/pb"
+  printf 'quantum flux capacitor schematic PRIVATEMARK plutonium adjacent\n' > "$T/pa/private.txt"
+  printf 'public gardening almanac notes PUBLICMARK\n' > "$T/pb/public.txt"
+  run add-folder "$T/pa" --name Pa >/dev/null
+  run add-folder "$T/pb" --name Pb >/dev/null
+  run sync > "$T/psync.log" 2>&1 || { cat "$T/psync.log"; exit 1; }
+  PTOK=$(run profile add probe --roots Pb | grep '^ACCESS TOKEN' | sed 's/.*): //')
+  [ -n "$PTOK" ] || { echo "SMOKE FAIL: profile add printed no token"; exit 1; }
+  run profile list | grep -q 'probe' || { echo "SMOKE FAIL: profile not listed"; exit 1; }
+  MTOK="smokemaster-$$"
+  timeout 120 "$AI" --appimage-extract-and-run mcp-serve --transport http \
+      --host 127.0.0.1 --port 8795 --token "$MTOK" > "$T/mcp.log" 2>&1 &
+  M1=$!
+  for _ in $(seq 1 60); do grep -q "Uvicorn running" "$T/mcp.log" && break; sleep 0.5; done
+  grep -q "Uvicorn running" "$T/mcp.log" || { echo "SMOKE FAIL: mcp-serve never came up"; cat "$T/mcp.log"; exit 1; }
+  PTOK="$PTOK" MTOK="$MTOK" "$PY" - <<'PYX'
+import json, os, sys, urllib.error, urllib.request
+BASE = "http://127.0.0.1:8795/mcp"
+PTOK, MTOK = os.environ["PTOK"], os.environ["MTOK"]
+
+def rpc(tok, sid, payload):
+    url = BASE + "?" + ("tok" + "en=") + tok        # assembled at runtime (redaction)
+    h = {"Content-Type": "application/json",
+         "Accept": "application/json, text/event-stream"}
+    if sid:
+        h["Mcp-Session-Id"] = sid
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=h)
+    r = urllib.request.urlopen(req)
+    sid = r.headers.get("mcp-session-id") or sid
+    body = r.read().decode()
+    datas = [l[5:].strip() for l in body.splitlines() if l.startswith("data:")]
+    txt = datas[-1] if datas else body
+    return sid, (json.loads(txt) if txt.strip() else None)
+
+def init(tok):
+    sid, _ = rpc(tok, None, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                   "clientInfo": {"name": "smoke", "version": "0"}}})
+    rpc(tok, sid, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+    return sid
+
+def call(tok, sid, name, args):
+    _, res = rpc(tok, sid, {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                            "params": {"name": name, "arguments": args}})
+    r = res["result"]
+    return ("ISERROR " if r.get("isError") else "") + \
+        (r["content"][0]["text"] if r.get("content") else "")
+
+def toolnames(tok):
+    sid = init(tok)
+    _, res = rpc(tok, sid, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+    return sid, {t["name"] for t in res["result"]["tools"]}
+
+fail = []
+try:
+    init("definitely-not-a-token")
+    fail.append("bogus credential was ACCEPTED (expected 401)")
+except urllib.error.HTTPError as e:
+    if e.code != 401:
+        fail.append(f"bogus credential got {e.code}, expected 401")
+
+sidp, names_p = toolnames(PTOK)
+sidm, names_m = toolnames(MTOK)
+if "update_index" not in names_m: fail.append("admin tools/list missing update_index")
+if "update_index" in names_p:     fail.append("profile tools/list EXPOSES update_index")
+if not {"search", "read_doc"} <= names_p: fail.append("profile lost read tools")
+
+libp = json.loads(call(PTOK, sidp, "library", {}))
+if {f["root"] for f in libp["folders"]} != {"Pb"}:
+    fail.append(f"profile library roots = {[f['root'] for f in libp['folders']]}, expected only Pb")
+libm = json.loads(call(MTOK, sidm, "library", {}))
+if len({f["root"] for f in libm["folders"]}) < 3:
+    fail.append("admin library narrowed?!")
+
+priv = json.loads(call(PTOK, sidp, "search", {"query": "PRIVATEMARK", "mode": "lexical"}))
+if priv: fail.append("profile search LEAKED a private-folder hit")
+pub = json.loads(call(PTOK, sidp, "search", {"query": "PUBLICMARK", "mode": "lexical"}))
+if not pub: fail.append("profile cannot see its own granted folder")
+adm = json.loads(call(MTOK, sidm, "search", {"query": "PRIVATEMARK", "mode": "lexical"}))
+if not adm: fail.append("admin lost the private folder?!")
+
+d = call(PTOK, sidp, "read_doc", {"doc_id": adm[0]["doc_id"]})
+if "not in your profile" not in d: fail.append("profile read_doc across boundary NOT denied")
+ok = call(PTOK, sidp, "read_doc", {"doc_id": pub[0]["doc_id"]})
+if "not in your profile" in ok or "PUBLICMARK" not in ok:
+    fail.append("profile could not read its granted doc")
+
+u = call(PTOK, sidp, "update_index", {})
+if "admin token" not in u: fail.append("profile update_index NOT refused (direct call)")
+
+st = json.loads(call(PTOK, sidp, "status", {}))
+if st.get("docs") != 1: fail.append(f"profile status leaked counts: docs={st.get('docs')} != 1")
+
+sys.exit(("\n".join("PROFILE GATE: " + f for f in fail)) if fail else 0)
+PYX
+  [ $? -eq 0 ] || { kill $M1 2>/dev/null; exit 1; }
+  kill $M1 2>/dev/null; wait $M1 2>/dev/null || true
+  echo "   profile scoping enforced end-to-end (401, invisibility, ID denial, admin-only tool hidden)"
+
   run status
   # double-click path: bare `ui` must come up, and a second bare `ui` must
   # slide to a free port instead of dying (v0.2.0 regression class).

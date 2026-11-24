@@ -326,46 +326,121 @@ def api_remove(cfg: Config, name: str) -> dict:
             **res}
 
 
+def api_profiles(cfg: Config, body: dict | None = None) -> dict:
+    """Shared-access profile manager (v0.3.0). GET (body=None) returns the
+    list; POST performs one action. Token plaintext is returned EXACTLY ONCE
+    (add/reset) — config stores only its hash. A running mcp-serve picks
+    every change up within one request (mtime-reloaded resolver), no restart."""
+    from .config import (add_profile, delete_profile, rename_profile,
+                         reset_profile_token, set_profile_enabled,
+                         set_profile_roots)
+    folders = [r.name for r in cfg.roots]
+    if body is None:
+        return {"profiles": [{"name": p.name, "roots": p.roots, "enabled": p.enabled}
+                             for p in cfg.profiles],
+                "folders": folders}
+    act = body.get("action", "")
+    name = str(body.get("name", "")).strip()
+    roots = [str(x) for x in (body.get("roots") or [])]
+    out: dict = {"ok": True}
+    if act == "add":
+        prof, plain = add_profile(cfg, name, roots)
+        out.update(name=prof.name, token=plain)
+    elif act == "rename":
+        prof = rename_profile(cfg, name, str(body.get("new", "")))
+        out["name"] = prof.name
+    elif act == "delete":
+        prof = delete_profile(cfg, name)
+        out["name"] = prof.name
+    elif act == "reset":
+        out["token"] = reset_profile_token(cfg, name)
+        out["name"] = name
+    elif act == "enable":
+        prof = set_profile_enabled(cfg, name, bool(body.get("enabled")))
+        out.update(name=prof.name, enabled=prof.enabled)
+    elif act == "roots":
+        prof = set_profile_roots(cfg, name, roots)
+        out.update(name=prof.name, roots=prof.roots)
+    else:
+        raise ValueError("unknown profiles action")
+    return out
+
+
 # ------------------------------------------------------------------ HTTP
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <title>Librarian</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-:root{--bg:#111418;--card:#1b2026;--txt:#e6e9ed;--mut:#8a94a0;--acc:#f5a623;--ok:#3fb96a;--line:#2a313a}
-*{box-sizing:border-box}body{margin:0;font:15px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--txt)}
-main{max-width:860px;margin:0 auto;padding:24px 16px 80px}
-h1{font-size:22px;margin:0 0 2px}h1 b{color:var(--acc)}
-.stats{color:var(--mut);font-size:13px;margin-bottom:20px}
-section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
-h2{font-size:14px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:0 0 12px}
-input[type=text]{width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--line);
-background:#0d1013;color:var(--txt);font-size:15px}
-button{background:var(--acc);color:#141414;border:0;border-radius:8px;padding:9px 16px;
-font-weight:600;cursor:pointer;font-size:14px}
-button.sec{background:#2a313a;color:var(--txt)}
+:root{--bg:#0d1015;--card:#151a21;--txt:#e9edf2;--mut:#93a0af;--acc:#f0a531;--ok:#43c975;--no:#e5645f;--line:#252d38;--rad:12px}
+html{color-scheme:dark}
+*{box-sizing:border-box}
+::-webkit-scrollbar{width:11px;height:11px}
+::-webkit-scrollbar-track{background:#0a0d11}
+::-webkit-scrollbar-thumb{background:#2c3642;border-radius:6px;border:2px solid #0a0d11}
+::-webkit-scrollbar-thumb:hover{background:#3a4757}
+input[type=checkbox]{accent-color:var(--acc);width:15px;height:15px}
+body{margin:0;font:15px/1.55 -apple-system,"Segoe UI",system-ui,sans-serif;
+ background:radial-gradient(1200px 520px at 72% -10%,#1c2532 0%,var(--bg) 62%) fixed,var(--bg);color:var(--txt)}
+main{max-width:880px;margin:0 auto;padding:30px 18px 110px}
+h1{font-size:24px;font-weight:750;margin:0 0 2px;letter-spacing:-.01em}
+h1 b{background:linear-gradient(90deg,var(--acc),#ffd08a);-webkit-background-clip:text;background-clip:text;color:transparent}
+.stats{color:var(--mut);font-size:13px;margin-bottom:22px}
+section{background:linear-gradient(180deg,var(--card),#141920);border:1px solid var(--line);border-radius:var(--rad);
+ padding:18px;margin-bottom:16px;box-shadow:0 8px 24px #00000038}
+h2{font-size:12.5px;font-weight:700;text-transform:uppercase;letter-spacing:.09em;color:var(--mut);margin:0 0 14px}
+h2 em{color:var(--acc);font-style:normal;font-weight:600;text-transform:none;letter-spacing:0;margin-left:8px}
+input[type=text]{width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--line);
+ background:#0b0e12;color:var(--txt);font-size:15px;outline:none;transition:border-color .15s}
+input[type=text]:focus{border-color:#3a4a5e}
+button{background:linear-gradient(180deg,#f7b23f,#df9925);color:#20160a;border:0;border-radius:9px;
+ padding:9px 16px;font-weight:700;cursor:pointer;font-size:13.5px;transition:filter .15s}
+button:hover{filter:brightness(1.08)}
+button.sec{background:#242c38;color:var(--txt);font-weight:600}
+button.tiny{padding:4px 10px;font-size:12px;border-radius:7px}
+button.danger{background:none;color:var(--no);border:1px solid #43302f;font-weight:600}
 button:disabled{opacity:.5;cursor:wait}
 .row{display:flex;gap:8px;margin-top:10px}.row input{flex:1}
-.lib{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
+.lbl{color:var(--mut);font-size:12px}
+.lib{display:flex;align-items:center;gap:12px;padding:11px 2px;border-bottom:1px solid var(--line)}
 .lib:last-child{border-bottom:0}
 .lib .nm{font-weight:600}.lib .pth{color:var(--mut);font-size:12px;word-break:break-all}
 .lib .cnt{margin-left:auto;color:var(--mut);font-size:13px;white-space:nowrap}
 .sw{position:relative;width:40px;height:22px;flex:none}
 .sw input{opacity:0;width:0;height:0}
-.sl{position:absolute;inset:0;background:#3a424c;border-radius:22px;transition:.15s;cursor:pointer}
+.sl{position:absolute;inset:0;background:#39424f;border-radius:22px;transition:.15s;cursor:pointer}
 .sl:before{content:"";position:absolute;width:16px;height:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.15s}
 input:checked+.sl{background:var(--ok)}input:checked+.sl:before{transform:translateX(18px)}
-.hit{padding:10px 0;border-bottom:1px solid var(--line)}.hit:last-child{border-bottom:0}
-.hit b{color:var(--acc);font-size:14px}.hit .lbl{color:var(--mut);font-size:12px}
-.hit p{margin:4px 0 0;font-size:14px;color:#c7cdd4}
+.hit{padding:11px 2px;border-bottom:1px solid var(--line)}.hit:last-child{border-bottom:0}
+.hit b{color:var(--acc);font-size:14px}
+.hit p{margin:4px 0 0;font-size:14px;color:#c8d0d9}
 #msg{font-size:13px;color:var(--ok);margin-left:10px;white-space:pre-line}
-.err{color:#e5645f!important}.del{background:none;color:#e5645f;padding:4px 8px;font-size:13px}
-.miss{color:#e5645f;font-size:12px}
-.warn{display:none;margin:10px 0;padding:10px 12px;border:1px solid #7a5b1e;border-radius:8px;background:#2a2213;color:#e8c46f;font-size:13.5px}
+.err{color:var(--no)!important}
+.miss{color:var(--no);font-size:12px}
+.warn{display:none;margin:12px 0;padding:11px 13px;border:1px solid #6b5116;border-radius:10px;
+ background:#231c0d;color:#e8c46f;font-size:13.5px}
 .crow{display:flex;align-items:center;gap:8px;margin:6px 0}
 .crow .cl{color:var(--mut);font-size:12px;min-width:170px}
-.crow code{flex:1;background:#0d1013;border:1px solid var(--line);border-radius:6px;
+.crow code{flex:1;min-width:0;background:#0b0e12;border:1px solid var(--line);border-radius:7px;
  padding:6px 9px;font-size:12.5px;word-break:break-all}
-.cp{background:#2a313a;color:var(--txt);padding:5px 10px;font-size:12px}
+.cbtns{display:flex;gap:6px;justify-content:flex-end;width:150px;flex:none}
+.cp{background:#242c38;color:var(--txt);padding:5px 10px;font-size:12px;font-weight:600}
+.prof{display:flex;gap:12px;align-items:flex-start;padding:13px 2px;border-bottom:1px solid var(--line)}
+.prof:last-child{border-bottom:0}
+.pmain{flex:1;min-width:0}
+.pchips{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}
+.pchip{display:inline-flex;position:relative}
+.pchip input{position:absolute;opacity:0}
+.pchip span{border:1px solid var(--line);background:#10151c;border-radius:99px;padding:3px 12px;
+ font-size:12.5px;color:var(--mut);cursor:pointer;user-select:none;transition:all .12s}
+.pchip input:checked+span{border-color:#6b5116;background:#2a2110;color:var(--acc)}
+.pbtns{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;max-width:200px}
+#tokbox{display:none;margin:12px 0;padding:12px 13px;border:1px solid #6b5116;border-radius:10px;background:#241d0e}
+#toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:50}
+.toast{background:#202934;border:1px solid var(--line);padding:10px 14px;border-radius:10px;
+ font-size:13.5px;max-width:360px;box-shadow:0 6px 18px #00000055}
+.toast.err{border-color:#5c2b2b;background:#2a1717;color:#f0b1ad}
+.grid2{display:grid;grid-template-columns:1fr auto;gap:8px}
+@media (max-width:640px){.pbtns{max-width:none}}
 </style></head><body><main>
 <h1><b>Librarian</b> — your document library</h1>
 <div class="stats" id="stats">loading…</div>
@@ -385,14 +460,27 @@ input:checked+.sl{background:var(--ok)}input:checked+.sl:before{transform:transl
 <button class="sec" onclick="addFolder()">Add folder</button></div>
 </section>
 
+<section><h2>Shared access <em>profiles — each friend gets their own token and sees only the folders you pick</em></h2>
+<div id="profs">loading…</div>
+<div id="tokbox"></div>
+<div class="row" style="border-top:1px solid var(--line);padding-top:14px">
+ <input type="text" id="pname" placeholder="New profile name, e.g. friend-1">
+ <button class="sec" onclick="addProf()">Create profile</button></div>
+<div class="pchips" id="newRoots" style="margin-top:10px"></div>
+<p class="lbl">A profile's token can be replaced ("new token") or switched off at any time — instantly, no server restart. Profiles are read-only; syncing stays yours.</p>
+</section>
+
 <section><h2>Connect an agent (MCP over the network)</h2>
 <div id="conn">loading…</div></section>
-</main><script>
+</main><div id="toasts"></div><script>
 const $=id=>document.getElementById(id);
 async function j(url,body){const o={headers:{'Content-Type':'application/json'}};
  if(body){o.method='POST';o.body=JSON.stringify(body)}
  const r=await fetch(url,o);const d=await r.json();if(d.error)throw new Error(d.error);return d}
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function toast(m,err){const t=document.createElement('div');t.className='toast'+(err?' err':'');t.textContent=m;
+ $('toasts').appendChild(t);setTimeout(()=>{t.style.opacity='0';t.style.transition='opacity .4s'},4200);
+ setTimeout(()=>t.remove(),4800)}
 async function refresh(){
  const s=await j('/api/state');
  $('stats').textContent=s.indexed?
@@ -408,14 +496,14 @@ async function refresh(){
  if(s.indexed&&s.textless>0){w.style.display='block';
   w.innerHTML=`${s.textless} file(s) have no searchable text. `
    +(s.tools&&!s.tools.pdftotext?`<b>No PDF extractor is available on this machine</b> — install poppler-utils or run the AppImage v0.2.5+ (it bundles its own). `:'')
-   +`<button class="sec" onclick="retryEmpty()">Retry textless files</button>`;}
+   +`<button class="sec tiny" onclick="retryEmpty()">Retry textless files</button>`;}
  else w.style.display='none';
  $('libs').innerHTML=(s.libraries||[]).map(l=>`<div class="lib">
   <label class="sw"><input type="checkbox" ${l.enabled?'checked':''} onchange="toggle('${esc(l.name)}',this.checked)"><span class="sl"></span></label>
   <div><div class="nm">${esc(l.name)} ${l.missing?'<span class="miss">(folder missing!)</span>':''}</div>
   <div class="pth">${esc(l.path)}</div></div>
   <div class="cnt">${l.docs} docs</div>
-  <button class="del" onclick="del('${esc(l.name)}')">Remove</button></div>`).join('')||'<i>No folders yet</i>';
+  <button class="danger tiny" onclick="del('${esc(l.name)}')">Remove</button></div>`).join('')||'<i>No folders yet</i>';
 }
 let _pp=null,_extinct=false;
 function prog(on){ if(on){ if(_pp)return; _pp=setInterval(async()=>{try{const s=await j('/api/state');
@@ -430,21 +518,55 @@ async function retryEmpty(){ $('sync').disabled=true;$('msg').textContent='retry
  try{const d=await j('/api/sync',{retry:true,ocr:$('ocr').checked});$('msg').textContent=d.summary||'done'}
  catch(e){$('msg').className='err';$('msg').textContent=''+e}
  prog(false);$('sync').disabled=false;refresh()}
-async function toggle(n,on){try{await j('/api/toggle',{name:n,enabled:on});refresh()}catch(e){alert(e)}}
+async function toggle(n,on){try{await j('/api/toggle',{name:n,enabled:on});refresh()}catch(e){toast(e,true)}}
 async function addFolder(){const p=$('newpath').value.trim();if(!p)return;
  $('msg').textContent='adding + indexing…';
  try{const d=await j('/api/add',{path:p});$('newpath').value='';$('msg').textContent=d.summary||'added'}
- catch(e){$('msg').className='err';$('msg').textContent=''+e}refresh()}
+ catch(e){$('msg').className='err';$('msg').textContent=''+e}refresh();profs()}
 async function del(n){if(!confirm(`Remove "${n}" from the library? (files on disk are NOT deleted)`))return;
- try{await j('/api/remove',{name:n})}catch(e){alert(e)}refresh()}
+ try{await j('/api/remove',{name:n})}catch(e){toast(e,true)}refresh();profs()}
 function copyrow(lbl,val,id){return `<div class="crow"><span class="cl">${lbl}</span>
  <code id="${id}">${esc(val)}</code>
- <button class="cp" onclick="cp('${id}')">copy</button></div>`}
+ <span class="cbtns"><button class="cp" onclick="cp('${id}')">copy</button></span></div>`}
 function cp(id){navigator.clipboard.writeText(document.getElementById(id).textContent)
  .then(()=>{const b=event.target;b.textContent='copied';setTimeout(()=>b.textContent='copy',1200)})}
-async function regen(){if(document.getElementById('tval')&&!confirm('Generate a NEW access token? The running MCP server keeps the old one until restarted, and every connected client must be updated.'))return;
+async function regen(){if(document.getElementById('tval')&&!confirm('Generate a NEW admin token? The running MCP server keeps the old one until restarted, and every connected client must be updated.'))return;
  try{const d=await j('/api/token',{action:'generate'});
-  alert('New token: '+d.token+'. '+d.note);conn();}catch(e){alert(e)}}
+  toast('New admin token saved. '+d.note);conn();}catch(e){toast(e,true)}}
+let _folders=[];
+function chips(folders,chosen){return folders.map(f=>`<label class="pchip"><input type="checkbox" value="${esc(f)}" ${chosen.includes(f)?'checked':''}><span>${esc(f)}</span></label>`).join('')||'<span class="lbl">no folders yet</span>'}
+async function profs(){
+ try{const d=await j('/api/profiles');_folders=d.folders||[];
+  $('newRoots').innerHTML=chips(_folders,[]);
+  $('profs').innerHTML=d.profiles.map(p=>`<div class="prof" data-name="${esc(p.name)}">
+   <label class="sw"><input type="checkbox" ${p.enabled?'checked':''} onchange="enProf('${esc(p.name)}',this.checked)"><span class="sl"></span></label>
+   <div class="pmain"><div class="nm">${esc(p.name)}
+    <button class="sec tiny" onclick="renProf('${esc(p.name)}')">rename</button></div>
+    <div class="pchips">${chips(_folders,p.roots)}</div></div>
+   <div class="pbtns"><button class="sec tiny" onclick="resetProf('${esc(p.name)}')">new token</button>
+    <button class="danger tiny" onclick="delProf('${esc(p.name)}')">delete</button></div></div>`).join('')
+   ||'<i class="lbl">No profiles yet — create one to share part of your library.</i>';
+  document.querySelectorAll('#profs .pchips input').forEach(i=>i.addEventListener('change',ev=>{
+   const row=ev.target.closest('.prof');setRoots(row.dataset.name,
+    [...row.querySelectorAll('.pchips input:checked')].map(x=>x.value));}));
+ }catch(e){$('profs').innerHTML='<span class="err">'+e+'</span>'}}
+function picked(sel){return [...document.querySelectorAll(sel+' input:checked')].map(i=>i.value)}
+function showTok(n,tok){$('tokbox').style.display='block';
+ $('tokbox').innerHTML=copyrow('Token for '+n+' — hand it out NOW',tok,'ptok')
+  +'<p class="lbl">Shown ONCE (only a hash is stored). Your friend uses the same client URL from “Connect an agent”, with this as ?token=… . Lost? “new token” makes a fresh one and this one dies.</p>'}
+async function addProf(){const n=$('pname').value.trim();if(!n){toast('Give the profile a name first',true);return}
+ try{const d=await j('/api/profiles',{action:'add',name:n,roots:picked('#newRoots')});
+  $('pname').value='';$('newRoots').querySelectorAll('input').forEach(i=>i.checked=false);
+  showTok(d.name,d.token);profs();}catch(e){toast(e,true)}}
+async function setRoots(n,roots){try{await j('/api/profiles',{action:'roots',name:n,roots})}catch(e){toast(e,true);profs()}}
+async function enProf(n,on){try{await j('/api/profiles',{action:'enable',name:n,enabled:on});
+ toast(on?'Profile enabled — token works again':'Profile disabled — token rejected')}catch(e){toast(e,true)}profs()}
+async function renProf(n){const nn=prompt('New name for profile "'+n+'":',n);if(!nn||nn===n)return;
+ try{await j('/api/profiles',{action:'rename',name:n,new:nn});profs()}catch(e){toast(e,true)}}
+async function resetProf(n){if(!confirm('Replace the token for "'+n+'"? The old token stops working IMMEDIATELY — give this person the new one.'))return;
+ try{const d=await j('/api/profiles',{action:'reset',name:n});showTok(n,d.token)}catch(e){toast(e,true)}}
+async function delProf(n){if(!confirm('Delete profile "'+n+'"? Its token stops working immediately.'))return;
+ try{await j('/api/profiles',{action:'delete',name:n});profs();toast('Profile deleted')}catch(e){toast(e,true)}}
 async function conn(){
  try{const c=await j('/api/connection');  let h='';
   if(c.mcp_running){
@@ -459,14 +581,12 @@ async function conn(){
    else h+='<p class="err">Tailscale not detected on this machine (install/connect tailscale, or use a LAN address)</p>';
    if(c.lan_ips.length)h+=copyrow('LAN address(es)',c.lan_ips.join(', '),'lanips');
   }
-  // token manager lives OUTSIDE the running/not-running branch: it is needed
-  // to start the server in the first place (chicken-and-egg bug, v0.2.2)
-  if(c.token_set)h+=`<div class="crow"><span class="cl">Access token</span>
+  if(c.token_set)h+=`<div class="crow"><span class="cl">Admin token (full access)</span>
      <code id="tval">${esc(c.token)}</code>
-     <button class="cp" onclick="cp('tval')">copy</button>
-     <button class="cp" onclick="regen()">regenerate</button></div>
-     <p class="lbl">This page is reachable only from this machine (127.0.0.1); clients elsewhere use the URL above with this token. Changing it takes effect when the MCP server restarts, and every connected client must be updated.</p>`;
-  else h+=`<p class="err">No access token set — required before the server can start on a network address.</p>
+     <span class="cbtns"><button class="cp" onclick="regen()">regenerate</button>
+     <button class="cp" onclick="cp('tval')">copy</button></span></div>
+     <p class="lbl">This page is reachable only from this machine (127.0.0.1). Use the URL above with this token yourself; friends and colleagues use the SAME URL with their own profile token (see “Shared access”). Changing the admin token takes effect when the MCP server restarts. New profile tokens work immediately.</p>`;
+  else h+=`<p class="err">No admin token set — required before the server can start on a network address (profile tokens alone also work).</p>
      <button class="cp" onclick="regen()">generate a token now</button>`;
   $('conn').innerHTML=h;
  }catch(e){$('conn').innerHTML='<span class="err">'+e+'</span>'}}
@@ -478,7 +598,7 @@ $('q').addEventListener('keydown',async e=>{if(e.key!=='Enter')return;
   <div class="lbl">${esc(h.folder)}</div><p>${esc(h.snippet)}</p></div>`).join('')
   :'<p class="lbl">no matches</p>'}
  catch(e){$('results').innerHTML=`<p class="err">${e}</p>`}});
-refresh();conn();setInterval(conn,15000);
+refresh();profs();conn();setInterval(conn,15000);
 </script></body></html>"""
 
 
@@ -509,6 +629,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_state(cfg))
             elif u.path == "/api/connection":
                 self._json(api_connection(cfg))
+            elif u.path == "/api/profiles":
+                self._json(api_profiles(cfg))
             elif u.path == "/api/search":
                 qs = parse_qs(u.query)
                 q = (qs.get("q") or [""])[0]
@@ -540,6 +662,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_toggle(cfg, body.get("name", ""), bool(body.get("enabled"))))
             elif u.path == "/api/token":
                 self._json(api_token(cfg, body.get("action", ""), body.get("value", "")))
+            elif u.path == "/api/profiles":
+                self._json(api_profiles(cfg, body))
             elif u.path == "/api/remove":
                 self._json(api_remove(cfg, body.get("name", "")))
             else:
