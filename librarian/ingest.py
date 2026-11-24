@@ -554,10 +554,13 @@ def status(cfg: Config, exclude_roots: list[str] | None = None) -> dict:
     must not leak the existence of other libraries."""
     import json
     from .extract import tool_path
-    if not cfg.db_path.exists():
-        return {"indexed": False, "db": str(cfg.db_path)}
-    db = connect(cfg.db_path, read_only=True)
     excl = [e for e in (exclude_roots or [])]
+    if not cfg.db_path.exists():
+        out = {"indexed": False}
+        if not excl:
+            out["db"] = str(cfg.db_path)
+        return out
+    db = connect(cfg.db_path, read_only=True)
     rcond = ""
     rargs: list = []
     if excl:
@@ -570,7 +573,6 @@ def status(cfg: Config, exclude_roots: list[str] | None = None) -> dict:
 
     out = {
         "indexed": True,
-        "db": str(cfg.db_path),
         "db_mb": round(cfg.db_path.stat().st_size / 1e6, 1),
         "docs": db.execute(f"SELECT COUNT(*) c FROM docs WHERE 1=1{rcond}", rargs).fetchone()["c"],
         "with_text": db.execute(
@@ -597,6 +599,10 @@ def status(cfg: Config, exclude_roots: list[str] | None = None) -> dict:
             "SELECT folder, COUNT(*) c FROM docs WHERE dup_of IS NULL"
             + rcond + " GROUP BY folder ORDER BY c DESC LIMIT 40", rargs)],
     }
+    if not excl:
+        out["db"] = str(cfg.db_path)   # admin only: path reveals the account name
+    else:
+        out.pop("db_mb", None)         # global index size hints at hidden libraries
     db.close()
     return out
 

@@ -32,8 +32,24 @@ class FakeReq:
         self.query_params = {k: v[0] for k, v in parse_qs(query.decode()).items()}
 
 
+# Config.load() deliberately prefers the LIBRARIAN_DATA env var over its
+# argument — a shell that exported it (ours has, twice, bite #2) would point
+# every 'temporary' config at the same dir and profiles would 'already
+# exist'. Tests therefore set the env explicitly and restore it always.
+_ORIG_LD = os.environ.get("LIBRARIAN_DATA")
+
+
+class _LDTest(unittest.TestCase):
+    def tearDown(self):
+        if _ORIG_LD is None:
+            os.environ.pop("LIBRARIAN_DATA", None)
+        else:
+            os.environ["LIBRARIAN_DATA"] = _ORIG_LD
+
+
 def _mk_roots(cfg_dir: Path, names):
     """write a real config.toml (template) + library dirs/roots; returns Config"""
+    os.environ["LIBRARIAN_DATA"] = str(cfg_dir)
     (cfg_dir / "config.toml").write_text(Config.template())
     cfg = Config.load(cfg_dir)
     for n in names:
@@ -44,7 +60,7 @@ def _mk_roots(cfg_dir: Path, names):
     return cfg
 
 
-class TokenTests(unittest.TestCase):
+class TokenTests(_LDTest):
     def test_hash_roundtrip_and_mismatch(self):
         t = gen_token()
         h = hash_token(t)
@@ -66,7 +82,7 @@ class TokenTests(unittest.TestCase):
             self.assertEqual(oct(Path(tmp, "config.toml").stat().st_mode)[-3:], "600")
 
 
-class ProfileCrudTests(unittest.TestCase):
+class ProfileCrudTests(_LDTest):
     def setUp(self):
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -122,7 +138,7 @@ class ProfileCrudTests(unittest.TestCase):
         self.assertEqual([p.roots for p in cfg2.profiles], [["A"]])
 
 
-class ResolverTests(unittest.TestCase):
+class ResolverTests(_LDTest):
     def setUp(self):
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -159,7 +175,7 @@ class ResolverTests(unittest.TestCase):
         self.assertFalse(self.r.is_admin("changed-later"))
 
 
-class CredentialTests(unittest.TestCase):
+class CredentialTests(_LDTest):
     # NB: query credentials are assembled at runtime ('tok'+'en=') — tooling
     # redacts credential-shaped literals in transit, which bit this very test.
     def test_header_and_query(self):
@@ -175,7 +191,7 @@ class _FakeTool:
         self.name = name
 
 
-class MiddlewareTests(unittest.TestCase):
+class MiddlewareTests(_LDTest):
     def setUp(self):
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -220,7 +236,7 @@ class MiddlewareTests(unittest.TestCase):
         self.assertIsNone(CURRENT.get())
 
 
-class ScopeMathTests(unittest.TestCase):
+class ScopeMathTests(_LDTest):
     def setUp(self):
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -245,7 +261,7 @@ class ScopeMathTests(unittest.TestCase):
         self.assertEqual(excluded_roots(self.cfg, p2), ["A", "B", "C"])
 
 
-class ListToolsFilterTests(unittest.TestCase):
+class ListToolsFilterTests(_LDTest):
     def test_admin_only_hidden_for_profiles(self):
         from librarian.mcp_http import install_profile_scope
         from librarian.mcp_server import mcp as srv
@@ -361,6 +377,10 @@ class ToolEnforcementTests(unittest.TestCase):
         self.assertEqual(prof["docs"], 1)
         self.assertEqual(prof["chunks"], 1)
         self.assertNotIn("secret content about A", json.dumps(prof))
+        # no host/index metadata that reveals the hidden libraries
+        self.assertNotIn("db", prof)
+        self.assertNotIn("db_mb", prof)
+        self.assertIn("db", admin)
 
     def test_update_index_refused_for_profiles(self):
         self._open_db()
