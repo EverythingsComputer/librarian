@@ -40,6 +40,9 @@ class FakeEmbedder:
     def embed_one(self, text):
         return [0.1, 0.2, 0.3, 0.4]
 
+    def embed_batch(self, texts, batch_size: int = 64):
+        return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
+
     def embed(self, texts):
         return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
 
@@ -50,12 +53,18 @@ def _make_txt(p, text):
 
 
 def _seed_db(cfg, paths):
-    """Rows for files that were indexed before (pretend they exist)."""
+    """Rows for files that were indexed before. size/mtime match disk where the
+    file exists, so sync sees them unchanged unless the test wants otherwise."""
     db = init_db(cfg.db_path, 4)
     for i, sp in enumerate(paths):
+        try:
+            st = Path(sp).stat()
+            size, mtime = st.st_size, st.st_mtime
+        except OSError:
+            size, mtime = 10, 0
         db.execute("INSERT INTO docs(id,path,root,folder,kind,title,ext,size,mtime)"
-                   " VALUES(?,?,?,?,?,?,?,?,0)",
-                   (i + 1, sp, "lib", "/", "text", Path(sp).stem, "txt", 10))
+                   " VALUES(?,?,?,?,?,?,?,?,?)",
+                   (i + 1, sp, "lib", "/", "text", Path(sp).stem, "txt", size, mtime))
         db.execute("INSERT INTO chunks(id,doc_id,label,text) VALUES(?,?,?,?)",
                    (i + 1, i + 1, "p.1", f"body of {Path(sp).stem}"))
     db.commit()
@@ -160,6 +169,26 @@ class PruneSafetyTests(unittest.TestCase):
         build_or_update(self.cfg, report=rep)
         self.assertEqual(rep["prune_blocked"], 0)
         self.assertEqual(rep["removed"], 200)
+
+    def test_mojibake_titles_repaired_in_place(self):
+        correct = "اللغة العربية"
+        broken = correct.encode("utf-8").decode("cp1252")
+        p = self.dd / "lib" / "ar.txt"
+        _make_txt(p, "نص عربي عن الحوكمة")   # file present: no re-extract needed
+        _seed_db(self.cfg, [str(p)])
+        db = connect(self.cfg.db_path)
+        db.execute("UPDATE docs SET title=? WHERE id=1", (broken,))
+        db.execute("INSERT INTO chunks_fts(rowid,title,text) VALUES(1,?,?)",
+                   (broken, "نص عربي"))
+        db.commit()
+        db.close()
+        build_or_update(self.cfg, report={})
+        db = connect(self.cfg.db_path, read_only=True)
+        title = db.execute("SELECT title FROM docs WHERE id=1").fetchone()["title"]
+        fts_title = db.execute("SELECT title FROM chunks_fts WHERE rowid=1").fetchone()["title"]
+        db.close()
+        self.assertEqual(title, correct)
+        self.assertEqual(fts_title, correct)
 
 
 class MojibakeTests(unittest.TestCase):

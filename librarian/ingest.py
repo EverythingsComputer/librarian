@@ -135,7 +135,7 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
     print(f"embeddings: {cfg.embed_backend} {cfg.embed_model} ({probe.dims}d)")
 
     db = init_db(cfg.db_path, probe.dims)
-    existing = {r["path"]: r for r in db.execute("SELECT * FROM docs")}
+    existing = {r["path"]: dict(r) for r in db.execute("SELECT * FROM docs")}
 
     # B1 cleanup: previously-indexed OOXML package internals go now, whatever
     # the prune settings say.
@@ -146,6 +146,21 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
     if junk:
         existing = {sp: r for sp, r in existing.items()
                     if r["id"] not in {j['id'] for j in junk}}
+
+    # B2 repair: titles double-encoded by the old PDF metadata path (Arabic
+    # showed as 'Ø§Ù—...'). Fix in place — no re-extraction needed, and it
+    # converges (repaired titles pass through fix_mojibake unchanged).
+    from .extract import fix_mojibake as _fixt
+    for r in list(existing.values()):
+        t0 = r["title"] or ""
+        t1 = _fixt(t0)
+        if t1 != t0:
+            db.execute("UPDATE docs SET title=? WHERE id=?", (t1, r["id"]))
+            db.execute("""UPDATE chunks_fts SET title=?
+                          WHERE rowid IN (SELECT id FROM chunks WHERE doc_id=?)""",
+                       (t1, r["id"]))
+            r["title"] = t1
+            print(f"~ title repaired: {t0[:40]!r} -> {t1[:40]!r}")
 
     plans: list[tuple[str, Path]] = []   # ('new'|'update', path)
     seen: set[str] = set()
@@ -255,6 +270,8 @@ def build_or_update(cfg: Config, force: bool = False, use_llm_summaries: bool = 
             db.commit()
 
     # ---- guarded prune (v0.2.9) ------------------------------------------------
+    if cancel.is_set():
+        cancelled = True          # may have been set before/after the loop too
     # Rules learned from the incident where a transiently-unreadable USB root
     # looked like 2,501 deleted files and the index obeyed:
     #   * runs AFTER indexing, so a killed build never prunes;
