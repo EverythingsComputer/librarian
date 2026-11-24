@@ -99,7 +99,9 @@ INSTRUCTIONS_NOTE = "see server instructions"
 
 @mcp.tool()
 def status() -> str:
-    """Index stats: doc/chunk counts, folders, last build time."""
+    """Index stats: doc/chunk counts, folders, last build time. The 'sync'
+    field shows live progress while an index build runs (active, done/total,
+    current file, seconds on it)."""
     from .config import Config
     from .ingest import status as _status
     return _j(_status(Config.load()))   # fresh: must reflect UI toggles made mid-session
