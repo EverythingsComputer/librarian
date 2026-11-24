@@ -54,20 +54,29 @@ def _bundle_bin():
 def fix_mojibake(s: str) -> str:
     """Repair UTF-8 bytes misread as cp1252/latin-1 (classic PDF /Title bug):
     'Ù—' back to 'اٗ'. Only accepted when the round-trip yields real text and
-    changes the string; correctly-decoded titles pass through untouched (B2)."""
-    if not s or all(ord(c) < 128 for c in s):
-        return s
-    for enc in ("cp1252", "latin-1"):
-        try:
-            b = s.encode(enc)
-        except UnicodeEncodeError:
-            continue
-        try:
-            r = b.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        if r != s:
-            return r
+    changes the string; correctly-decoded titles pass through untouched (B2).
+    Some producers double-encoded (Ã¢â‚¬â€œ for –): iterate to a fixed point so
+    one sync fully repairs (v0.2.12 — the Optiplex log showed half-repaired
+    'â€“' titles that needed a second pass)."""
+    for _ in range(4):
+        if not s or all(ord(c) < 128 for c in s):
+            return s
+        repaired = None
+        for enc in ("cp1252", "latin-1"):
+            try:
+                b = s.encode(enc)
+            except UnicodeEncodeError:
+                continue
+            try:
+                r = b.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if r != s:
+                repaired = r
+                break
+        if repaired is None:
+            return s
+        s = repaired
     return s
 
 

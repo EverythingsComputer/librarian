@@ -202,6 +202,14 @@ class MojibakeTests(unittest.TestCase):
         self.assertEqual(fix_mojibake("Nuclear Doctrine 1962"), "Nuclear Doctrine 1962")
         self.assertEqual(fix_mojibake("Café résumé"), "Café résumé")  # not valid utf-8 round-trip
 
+    def test_double_encoded_converges_in_one_call(self):
+        correct = "Mapping Bacillus Calmette–Guérin vaccine"
+        double = correct.encode("utf-8").decode("cp1252").encode("cp1252").decode("cp1252")
+        self.assertNotEqual(double, correct)
+        self.assertEqual(fix_mojibake(double), correct)
+        # idempotent on already-clean text
+        self.assertEqual(fix_mojibake(correct), correct)
+
 
 class BundleToolPathTests(unittest.TestCase):
     def test_sibling_of_executable_found_without_path(self):
