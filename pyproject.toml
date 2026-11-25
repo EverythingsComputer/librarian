@@ -1,12 +1,14 @@
 [project]
 name = "librarian"
-version = "0.3.1"
+version = "0.4.0"
 description = "Agent-first document library search: hybrid BM25+vector over PDF/PPTX/DOCX/TXT/MSG, exposed as CLI + MCP server"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "EverythingsComputer"}]
 dependencies = [
     "python-pptx>=1.0",
+    "pypdf>=5.0",
+    "reportlab>=4.0",
     "python-docx>=1.1",
     "extract-msg>=0.48",
     "fastembed>=0.4",

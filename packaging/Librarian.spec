@@ -8,7 +8,8 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 REPO = Path(SPECPATH).parent
 
 datas, binaries, hiddenimports = [], [], []
-for pkg in ("onnxruntime", "sqlite_vec", "fastembed", "extract_msg"):
+for pkg in ("onnxruntime", "sqlite_vec", "fastembed", "extract_msg",
+            "reportlab", "pypdf"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b

@@ -275,6 +275,141 @@ PYX
   kill $M1 2>/dev/null; wait $M1 2>/dev/null || true
   echo "   profile scoping enforced end-to-end (401, invisibility, ID denial, admin-only tool hidden)"
 
+  # ---- v0.4.0 downloads + export, on the SHIPPED artifact: the folder
+  # master switch > profile files-grant hierarchy over real /file fetches,
+  # plus a real OCR-baked searchable copy whose text layer is proven
+  # extractable while the original stays byte-identical. (A leak here is a
+  # privacy incident; a mangled original is data loss: release blockers.)
+  echo "-- downloads + export:"
+  mkdir -p "$T/pc"
+  printf 'download probe DLPROBE marker v040 gate\n' > "$T/pc/dl.txt"
+  run add-folder "$T/pc" --name Pc >/dev/null
+  run sync > "$T/dlsync.log" 2>&1 || { cat "$T/dlsync.log"; exit 1; }
+  DTOK=$(run profile add dlprobe --roots Pc | grep '^ACCESS TOKEN' | sed 's/.*): //')
+  TTOK=$(run profile add tprobe --roots Pc | grep '^ACCESS TOKEN' | sed 's/.*): //')
+  { [ -n "$DTOK" ] && [ -n "$TTOK" ]; } || { echo "SMOKE FAIL: profile tokens missing"; exit 1; }
+  run profile files dlprobe >/dev/null          # grant raw files to dlprobe
+  run folder-files Pc --off >/dev/null          # but the FOLDER blocks first
+
+  sha_before=$(sha256sum "$T/docs/scan-only.pdf" | cut -d' ' -f1)
+  timeout 300 "$AI" --appimage-extract-and-run export --folders docs --out "$T/xout" --json > "$T/x.json" 2>&1 \
+    || { echo "SMOKE FAIL: export CLI errored"; cat "$T/x.json"; exit 1; }
+  grep -q '"exported": 1' "$T/x.json" || { echo "SMOKE FAIL: export JSON has no exported:1"; cat "$T/x.json"; exit 1; }
+  [ -f "$T/xout/scan-only.searchable.pdf" ] || { echo "SMOKE FAIL: no searchable copy"; exit 1; }
+  pdftotext "$T/xout/scan-only.searchable.pdf" - 2>/dev/null | grep -qi zirconium \
+    || { echo "SMOKE FAIL: searchable copy has NO extractable text layer"; exit 1; }
+  sha_after=$(sha256sum "$T/docs/scan-only.pdf" | cut -d' ' -f1)
+  [ "$sha_before" = "$sha_after" ] || { echo "SMOKE FAIL: export MODIFIED the original file"; exit 1; }
+  run export --folders docs --out "$T/xout" --json > "$T/x2.json" 2>&1
+  grep -q '"skipped_existing": 1' "$T/x2.json" \
+    || { echo "SMOKE FAIL: rerun re-exported an existing copy"; cat "$T/x2.json"; exit 1; }
+  echo "   searchable copy carries real text; original byte-identical; rerun keeps it"
+
+  timeout 120 "$AI" --appimage-extract-and-run mcp-serve --transport http \
+      --host 127.0.0.1 --port 8797 --token "$MTOK" > "$T/mcp3.log" 2>&1 &
+  M3=$!
+  for _ in $(seq 1 60); do grep -q "Uvicorn running" "$T/mcp3.log" && break; sleep 0.5; done
+  grep -q "Uvicorn running" "$T/mcp3.log" || { echo "SMOKE FAIL: mcp (dl gate) never came up"; cat "$T/mcp3.log"; exit 1; }
+  DTOK="$DTOK" TTOK="$TTOK" MTOK="$MTOK" "$PY" - >"$T/docid" <<'PYX'
+import json, os, sys, urllib.error, urllib.request
+B, DTOK, TTOK, MTOK = ("http://127.0.0.1:8797",
+                       os.environ["DTOK"], os.environ["TTOK"], os.environ["MTOK"])
+fail = []
+
+def get(path, tok):
+    url = B + path + "?" + ("tok" + "en=") + tok
+    try:
+        r = urllib.request.urlopen(url)
+        return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+def rpc(tok, sid, payload):
+    url = B + "/mcp?" + ("tok" + "en=") + tok
+    h = {"Content-Type": "application/json",
+         "Accept": "application/json, text/event-stream"}
+    if sid:
+        h["Mcp-Session-Id"] = sid
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=h)
+    r = urllib.request.urlopen(req)
+    sid = r.headers.get("mcp-session-id") or sid
+    body = r.read().decode()
+    datas = [l[5:].strip() for l in body.splitlines() if l.startswith("data:")]
+    txt = datas[-1] if datas else body
+    return sid, (json.loads(txt) if txt.strip() else None)
+
+def init(tok):
+    sid, _ = rpc(tok, None, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                   "clientInfo": {"name": "smoke", "version": "0"}}})
+    rpc(tok, sid, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+    return sid
+
+def call(tok, sid, name, args):
+    _, res = rpc(tok, sid, {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                            "params": {"name": name, "arguments": args}})
+    r = res["result"]
+    return r["content"][0]["text"] if r.get("content") else ""
+
+try:
+    # find Pc's doc id as the files-granted profile sees it
+    sid = init(DTOK)
+    hits = json.loads(call(DTOK, sid, "search", {"query": "DLPROBE", "mode": "lexical"}))
+    if not hits: fail.append("files-granted profile cannot see its granted doc")
+    doc_id = hits[0]["doc_id"] if hits else 1
+    sys.stdout.write(str(doc_id))
+    # folder master switch beats a profile files-grant: both profiles 403
+    for who, tok in (("text-only", TTOK), ("files-granted", DTOK)):
+        code, body = get("/file/%d" % doc_id, tok)
+        if code != 403: fail.append(f"folder-blocked {who} profile /file got {code}, want 403")
+    # admin always downloads their own library, even master-blocked folders
+    code, body = get("/file/%d" % doc_id, MTOK)
+    if code != 200 or b"DLPROBE" not in body:
+        fail.append(f"admin /file blocked-folder download got {code}")
+    # unknown credential is a 401 on this route too (same gate as MCP)
+    try:
+        code, _ = get("/file/%d" % doc_id, "definitely-not-a-token")
+        if code != 401: fail.append(f"bogus token /file got {code}, want 401")
+    except urllib.error.HTTPError as e:
+        if e.code != 401: fail.append(f"bogus token /file got {e.code}, want 401")
+    # file_url tool honors the same policy (folder still blocked here)
+    fu = json.loads(call(DTOK, sid, "file_url", {"doc_id": doc_id}))
+    if "error" not in fu: fail.append("file_url gave a URL while the FOLDER blocks")
+except Exception as e:
+    fail.append(f"dl gate crashed: {e!r}")
+sys.exit(("\n".join("DOWNLOAD GATE: " + f for f in fail)) if fail else 0)
+PYX
+  DLRC=$?
+  [ $DLRC -eq 0 ] || { kill $M3 2>/dev/null; exit 1; }
+  DOCID=$(cat "$T/docid")
+  run folder-files Pc >/dev/null                # lift the master block
+  DTOK="$DTOK" TTOK="$TTOK" DOCID="$DOCID" "$PY" - <<'PYX'
+import os, sys, urllib.request
+B, DTOK, TTOK = ("http://127.0.0.1:8797", os.environ["DTOK"], os.environ["TTOK"])
+fail = []
+
+def get(path, tok):
+    url = B + path + "?" + ("tok" + "en=") + tok
+    try:
+        r = urllib.request.urlopen(url)
+        return r.status, r.read()
+    except Exception as e:
+        code = getattr(e, "code", None)
+        if code: return code, e.read()
+        raise
+
+DOCID = os.environ["DOCID"]
+code, body = get("/file/" + DOCID, DTOK)
+if code != 200 or b"DLPROBE" not in body: fail.append(f"files-granted download got {code}, want 200 bytes")
+code, body = get("/file/" + DOCID, TTOK)
+if code != 403 or b"text-only" not in body: fail.append(f"text-only profile got {code}, want 403 text-only")
+sys.exit(("\n".join("DOWNLOAD GATE: " + f for f in fail)) if fail else 0)
+PYX
+  DLRC=$?
+  kill $M3 2>/dev/null; wait $M3 2>/dev/null || true
+  [ $DLRC -eq 0 ] || exit 1
+  echo "   download hierarchy enforced over the wire (folder master > profile grant > admin override)"
+
   run status
   # double-click path: bare `ui` must come up, and a second bare `ui` must
   # slide to a free port instead of dying (v0.2.0 regression class).

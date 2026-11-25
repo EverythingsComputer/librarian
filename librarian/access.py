@@ -32,6 +32,11 @@ from .config import Config, Profile, token_matches
 CURRENT: contextvars.ContextVar[Profile | None] = contextvars.ContextVar(
     "librarian_profile", default=None)
 
+# absolute origin ("http://host:port") of the current HTTP request, so tools
+# can hand out URLs the client can actually reach. None on stdio.
+ORIGIN: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "librarian_origin", default=None)
+
 # tools a shared profile must never see or call (everything else is read-only)
 ADMIN_ONLY_TOOLS = frozenset({"update_index"})
 
@@ -155,6 +160,27 @@ def visible_root(cfg: Config, prof: Profile | None, root: str | None) -> bool:
     return (root in set(prof.roots)) and (root not in set(cfg.disabled_roots))
 
 
+def download_block(cfg: Config, prof: Profile | None, root: str | None) -> str | None:
+    """v0.4.0 raw-file download policy. Returns None when the download may
+    proceed, else a refusal reason. Hierarchy: the FOLDER's `files` flag is
+    the master gate (a folder can forbid downloads for everyone but the
+    admin), the PROFILE's `files` grant is secondary. Admin (prof None) is
+    always allowed. Invisible docs must be answered with the generic
+    not-in-profile message so this gate can't be probed."""
+    if prof is None:
+        return None
+    if not visible_root(cfg, prof, root):
+        return "document not in your profile"
+    if not prof.files:
+        return ("your profile is text-only: the admin has not granted file "
+                "downloads to it")
+    for r in cfg.roots:
+        if r.name == root and not r.files:
+            return ("file downloads are switched off for this library folder "
+                    "by the administrator")
+    return None
+
+
 def doc_root(db, doc_id: int) -> str | None | bool:
     """root column of a doc; False means the doc does not exist at all."""
     row = db.execute("SELECT root FROM docs WHERE id=?", (doc_id,)).fetchone()
@@ -182,11 +208,21 @@ class ProfileMiddleware:
         # mid-session, fall back to its last-known object or deny broadly:
         if token and prof is None and not self.resolver.is_admin(token):
             prof = _DENIED
+        origin = None
+        req = getattr(ctx, "request", None)
+        if req is not None:
+            try:
+                host = req.headers.get("host") or req.url.netloc
+                origin = f"{req.url.scheme}://{host}"
+            except Exception:
+                origin = None
         t = CURRENT.set(prof)
+        t2 = ORIGIN.set(origin)
         try:
             return await call_next(ctx)
         finally:
             CURRENT.reset(t)
+            ORIGIN.reset(t2)
 
 
 class _Denied:
@@ -195,6 +231,7 @@ class _Denied:
     token_hash = ""
     roots: list[str] = []
     enabled = False
+    files = False
 
 
 _DENIED = _Denied()

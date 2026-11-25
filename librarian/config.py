@@ -37,6 +37,8 @@ class LibraryRoot:
     name: str
     exclude: list[str] = field(default_factory=list)
     enabled: bool = True
+    files: bool = True    # False (v0.4.0): raw file downloads blocked for ALL
+                          # profiles from this folder, whatever they were granted
 
 
 @dataclass
@@ -53,6 +55,9 @@ class Profile:
     token_hash: str
     roots: list[str] = field(default_factory=list)
     enabled: bool = True
+    files: bool = False   # v0.4.0: may this profile download raw files at all?
+                          # default OFF — the admin grants it deliberately;
+                          # still subject to each folder's own files flag
 
 
 def gen_token() -> str:
@@ -110,7 +115,8 @@ class Config:
             p = Path(r["path"]).expanduser()
             roots.append(LibraryRoot(path=p, name=r.get("name") or p.name,
                                      exclude=list(r.get("exclude", [])),
-                                     enabled=bool(r.get("enabled", True))))
+                                     enabled=bool(r.get("enabled", True)),
+                                     files=bool(r.get("files", True))))
         idx = raw.get("index", {})
         emb = raw.get("embed", {})
         llm = raw.get("llm", {})
@@ -134,7 +140,8 @@ class Config:
             profiles=[Profile(name=str(p.get("name") or f"profile{i}"),
                               token_hash=str(p.get("token") or ""),
                               roots=[str(x) for x in p.get("roots", [])],
-                              enabled=bool(p.get("enabled", True)))
+                              enabled=bool(p.get("enabled", True)),
+                              files=bool(p.get("files", False)))
                       for i, p in enumerate(raw.get("profile", []))],
         )
 
@@ -267,6 +274,8 @@ def _render_roots(roots: list[LibraryRoot]) -> str:
             out.append(f"exclude = [{items}]\n")
         if not r.enabled:
             out.append("enabled = false   # switched off: kept in the index, hidden from search\n")
+        if not r.files:
+            out.append("files = false   # downloads of the raw files are blocked for all profiles\n")
         out.append("\n")
     return "".join(out).rstrip("\n") + "\n"
 
@@ -362,6 +371,8 @@ def _render_profiles(profiles: list[Profile]) -> str:
         out.append(f"{_PRO_HEADER}\nname = \"{p.name}\"\ntoken = \"{p.token_hash}\"\n")
         items = ", ".join(f'"{r}"' for r in p.roots)
         out.append(f"roots = [{items}]\n")
+        if p.files:
+            out.append("files = true    # this profile may download raw files (folders may still block)\n")
         if not p.enabled:
             out.append("enabled = false   # switched off: token rejected, kept for later\n")
         out.append("\n")
@@ -476,3 +487,21 @@ def set_profile_roots(cfg: Config, name: str, root_names: list[str]) -> Profile:
     prof.roots = _validate_profile_roots(cfg, root_names)
     write_profiles(cfg, cfg.profiles)
     return prof
+
+
+def set_profile_files(cfg: Config, name: str, on: bool) -> Profile:
+    """v0.4.0: grant/revoke raw-file downloads for a profile (secondary gate;
+    each folder's own `files` flag still applies on top)."""
+    prof = find_profile(cfg, name)
+    prof.files = bool(on)
+    write_profiles(cfg, cfg.profiles)
+    return prof
+
+
+def set_root_files(cfg: Config, name: str, on: bool) -> LibraryRoot:
+    """v0.4.0: master switch for raw-file downloads from a library folder —
+    OFF blocks EVERY profile's downloads from it, whatever they hold."""
+    root = find_root(cfg, name)
+    root.files = bool(on)
+    write_roots(cfg, cfg.roots)
+    return root

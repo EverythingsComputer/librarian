@@ -26,33 +26,117 @@ from pathlib import Path
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
-def _guard(app, resolver):
-    """HTTP gate: 401 anything that is not the master token or a valid,
-    enabled profile token."""
+def _extract_token(scope) -> str:
+    from urllib.parse import parse_qs
+    headers = dict(scope.get("headers") or [])
+    auth = headers.get(b"authorization", b"").decode(errors="ignore")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    qs = parse_qs(scope.get("query_string", b"").decode(errors="ignore"))
+    return qs.get("token", [""])[0]
+
+
+async def _send_json(send, code: int, obj) -> None:
+    import json
+    body = json.dumps(obj).encode()
+    await send({"type": "http.response.start", "status": code,
+                "headers": [(b"content-type", b"application/json"),
+                            (b"content-length", str(len(body)).encode())]})
+    await send({"type": "http.response.body", "body": body})
+
+
+def _gate(app, resolver, data_dir):
+    """Root ASGI wrapper.
+    1. 401 anything that is not the master token or a valid, enabled profile
+       token (when any credential is configured at all).
+    2. serves GET /file/<doc_id>: streams the original document file, with
+       the v0.4.0 download hierarchy (folder master flag > profile files
+       grant; admin always allowed)."""
 
     async def wrapped(scope, receive, send):
+        if scope["type"] == "http" and scope.get("path", "").startswith("/file/"):
+            await _serve_file(scope, receive, send, resolver, data_dir)
+            return
         if scope["type"] == "http":
-            from urllib.parse import parse_qs
-            headers = dict(scope.get("headers") or [])
-            tok = ""
-            # header names arrive lowercased per ASGI spec
-            auth = headers.get(b"authorization", b"").decode(errors="ignore")
-            if auth.startswith("Bearer "):
-                tok = auth[7:].strip()
-            if not tok:
-                qs = parse_qs(scope.get("query_string", b"").decode(errors="ignore"))
-                tok = qs.get("token", [""])[0]
-            if not resolver.accepts(tok):
-                body = b'{"error":"unauthorized"}'
-                await send({"type": "http.response.start", "status": 401,
-                            "headers": [(b"www-authenticate", b"Bearer"),
-                                        (b"content-type", b"application/json"),
-                                        (b"content-length", str(len(body)).encode())]})
-                await send({"type": "http.response.body", "body": body})
+            tok = _extract_token(scope)
+            if (resolver.master_token or resolver.profile_list()) and not resolver.accepts(tok):
+                await _send_json(send, 401, {"error": "unauthorized"})
                 return
         await app(scope, receive, send)
 
     return wrapped
+
+
+async def _serve_file(scope, receive, send, resolver, data_dir) -> None:
+    import mimetypes
+    import os
+    import re as _re
+
+    if scope.get("method") not in ("GET", "HEAD"):
+        await _send_json(send, 405, {"error": "use GET"})
+        return
+    m = _re.fullmatch(r"/file/(\d+)", scope.get("path", ""))
+    if not m:
+        await _send_json(send, 404, {"error": "use /file/<doc_id>"})
+        return
+    doc_id = int(m.group(1))
+
+    from .access import download_block
+    from .config import Config
+    tok = _extract_token(scope)
+    cfg = Config.load(data_dir)
+    prof = None
+    if tok:
+        if resolver.is_admin(tok):
+            prof = None                      # admin
+        else:
+            prof = resolver.profile_for_token(tok)
+            if prof is None:
+                # unknown/revoked/disabled credential: same 401 as the MCP gate
+                await _send_json(send, 401, {"error": "unauthorized"})
+                return
+    elif resolver.master_token or resolver.profile_list():
+        await _send_json(send, 401, {"error": "unauthorized"})
+        return
+
+    from .db import connect
+    try:
+        db = connect(cfg.db_path, read_only=True)
+        row = db.execute("SELECT path, root, title FROM docs WHERE id=?", (doc_id,)).fetchone()
+        db.close()
+    except Exception:
+        await _send_json(send, 500, {"error": "index unavailable"})
+        return
+    if row is None:
+        await _send_json(send, 404, {"error": "no such document"})
+        return
+    path, root = row["path"], row["root"]
+
+    block = download_block(cfg, prof, root)
+    if block:
+        await _send_json(send, 403, {"error": block})
+        return
+
+    # defense against a tampered index: only serve inside configured roots
+    try:
+        rp = os.path.realpath(path)
+        ok = any(rp == os.path.realpath(str(r.path))
+                 or rp.startswith(os.path.realpath(str(r.path)) + os.sep)
+                 for r in cfg.roots)
+    except OSError:
+        ok = False
+    if not ok or not os.path.isfile(path):
+        await _send_json(send, 404, {"error": "file not present on this server"})
+        return
+
+    from starlette.responses import FileResponse
+    media = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    try:
+        await FileResponse(path, media_type=media,
+                           filename=os.path.basename(path),
+                           stat_result=os.stat(path))(scope, receive, send)
+    except Exception:
+        pass  # client aborted mid-download
 
 
 def install_profile_scope(mcp_obj, resolver) -> None:
@@ -118,19 +202,20 @@ def serve(cfg_dir: Path | None, host: str = "127.0.0.1", port: int = 8770,
     from .ingest import install_shutdown_hook
     install_shutdown_hook(app)      # Ctrl-C must stop an in-flight build/prune
     install_profile_scope(mcp, resolver)
-    if resolver.master_token or n_profiles:
-        app = _guard(app, resolver)
-        creds = []
-        if resolver.master_token:
-            creds.append("master token")
-        if n_profiles:
-            creds.append(f"{n_profiles} profile token(s)")
-        auth_note = f"  [{' + '.join(creds)} required]"
-    else:
-        auth_note = "  [no token — loopback only]"
+    app = _gate(app, resolver, data_dir)   # auth gate + /file downloads (always:
+    # loopback-no-credential = admin; credentials = enforced)
+    creds = []
+    if resolver.master_token:
+        creds.append("master token")
+    if n_profiles:
+        creds.append(f"{n_profiles} profile token(s)")
+    auth_note = (f"  [{' + '.join(creds)} required]" if creds
+                 else "  [no token — loopback only]")
 
     scheme = "http"  # terminate TLS with a reverse proxy (caddy/nginx) if needed
     print(f"librarian MCP (streamable-http) on {scheme}://{host}:{port}/mcp" + auth_note)
+    print(f"  document files: {scheme}://{host}:{port}/file/<doc_id> (same token; "
+          "subject to per-folder + per-profile download switches)")
     print("  example: mcp-client url = http://"
           + ("127.0.0.1" if host == "0.0.0.0" else host) + f":{port}/mcp")
     uvicorn.run(app, host=host, port=port, log_level="info")

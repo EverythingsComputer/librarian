@@ -181,6 +181,65 @@ token. Tokens travel in plain HTTP, so keep this on a private network
 (Tailscale) or behind an HTTPS proxy with its own protections in front —
 a token is then equivalent to a password you cannot see once handed out.
 
+## Who may download the actual files
+
+Reading and downloading are separate decisions. A profile can always ask
+its agent to search and read extracted text (`search`, `read_doc`, …) —
+that is what the index is for. Getting the **original file** out is gated
+by two switches, in strict hierarchy:
+
+1. **The folder's ⤓ switch** (Library folders, the small second toggle) —
+   master, wins over everything: off means **no profile** can download
+   anything from that folder, whatever its own grant says. Some folders
+   you may simply never want handed out.
+2. **The profile's ⤓ button** (Shared access) — only consulted when the
+   folder allows: `⤓ downloads on` hands out original files,
+   `⤓ text only` (the default for every new profile) does not.
+
+The admin token — yours, the one in the settings file — can always
+download any file of its own library, and the web page's own search
+results carry a ⤓ file link for you.
+
+An agent uses this natively: `file_url(doc_id)` returns a download URL
+(or a clear refusal explaining which switch blocked it), and
+`GET /file/<doc_id>` on the same MCP port with the same token streams the
+original bytes. No extra server, nothing to set up. From a terminal:
+
+```bash
+librarian profile files friend-1            # grant raw-file downloads
+librarian profile files friend-1 --off      # back to text-only
+librarian folder-files Chemistry --off      # master block: nobody downloads
+librarian folder-files Chemistry            # allow again (per profile grant)
+```
+
+## Searchable copies (export)
+
+Indexing never writes into your files: when Librarian OCRs a scanned PDF,
+the text lands in the index, not in the PDF. If you need a scanned
+document to *travel* with its OCR — to a tablet, another machine, a
+colleague — export a **searchable copy**:
+
+- Web page → **Searchable copies** → whole library or selected folders →
+  **Export copies**. Progress shows per file; the page can close, the run
+  continues; Cancel stops after the current file.
+- Or from a terminal:
+
+  ```bash
+  librarian export --all                          # every folder
+  librarian export --folders "Chemistry,History"  # chosen folders
+  librarian export --docs 12,37,88                # picked documents
+  librarian export --all --out /mnt/usb/scanned   # custom destination
+  ```
+
+For each scanned (zero-text) PDF this writes `<name>.searchable.pdf`
+into the destination folder, with a real invisible text layer baked
+in: selectable and searchable in any PDF reader, visually identical to
+the original. Originals are never
+modified (byte-for-byte), files that already have a text layer are left
+alone, an existing copy is never overwritten, and a cancelled run
+resumes where it stopped. Export is an owner action, available from the
+loopback web page or the terminal on the server — profiles never get it.
+
 ## Settings
 
 One plain-text file: `~/librarian/config.toml`. The defaults work as-is.
@@ -208,6 +267,9 @@ new machine: install there, copy the settings file (not the index), run
 | `librarian card 42` / `read 42` | a document's summary, or its full text |
 | `librarian related 42` | documents closest to number 42 in meaning |
 | `librarian status` | index size and state |
+| `librarian export --all` / `--folders` / `--docs` | searchable PDF copies (originals untouched) |
+| `librarian profile files NAME [--off]` | may that profile download original files? |
+| `librarian folder-files NAME [--off]` | master download block for a whole folder |
 | `--json` on most commands | machine-readable output for scripts |
 
 Nice touches for real libraries: duplicate copies of a document are detected
@@ -216,9 +278,10 @@ searchable; PDFs with no readable text are reported, never silently skipped.
 
 ## Known limitations
 
-- **Scanned PDFs** (photos of pages) are not searchable by default. Install
-  `ocrmypdf` and set `ocr = true` in the settings file to read them — much
-  slower, only if you need it.
+- **Scanned PDFs** (photos of pages) are read via OCR when enabled
+  (`ocr = true`, or the switch on the web page). The AppImage bundles
+  OCR tools; from source install poppler-utils + tesseract-ocr. OCR
+  stays in the index — to put it *in* a file, export a searchable copy.
 - Files over 150 MB are skipped. The contents of zip archives are skipped
   unless enabled in settings.
 - Meaning-based search scans the whole index exactly on every query: fast up
@@ -231,7 +294,9 @@ searchable; PDFs with no readable text are reported, never silently skipped.
 - The networked MCP server authenticates bearer tokens (admin + per-profile,
   v0.3.0): there is no rate limiting, no user accounts behind the tokens, and
   no built-in HTTPS (see security notes above). A token is a bearer secret —
-  whoever holds it holds the access.
+  whoever holds it holds the access. File downloads (v0.4.0) obey the
+  folder/profile ⤓ hierarchy, but note that a profile with text access can
+  always quote the *extracted text* its agent is allowed to read.
 
 ## License
 

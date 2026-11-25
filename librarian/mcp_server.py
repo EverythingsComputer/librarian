@@ -33,6 +33,9 @@ Workflow for thorough answers:
 3. read_doc(doc_id) to read whole documents (page-range with 'label_contains') and
    doc_card(doc_id) for a doc's summary/outline before committing to a full read.
 4. related(doc_id) to hop to neighboring documents; find_term for exact-phrase census.
+5. need the actual file (not just text)? file_url(doc_id) gives a download URL on
+   this same server for the original bytes — your same token authorizes it, unless
+   the admin restricted downloads for that folder or your profile.
 Cite documents by title + doc_id + page/slide label.
 Note: the user can switch individual library folders off (disable); switched-off
 folders are automatically excluded from every result — if the user mentions a
@@ -132,8 +135,11 @@ def status() -> str:
     field shows live progress while an index build runs (active, done/total,
     current file, seconds on it)."""
     from .config import Config
+    from .export import export_progress_snapshot
     from .ingest import status as _status
-    return _j(_status(Config.load(), exclude_roots=_excl()))   # fresh + profile-scoped
+    out = _status(Config.load(), exclude_roots=_excl())   # fresh + profile-scoped
+    out["export"] = export_progress_snapshot()
+    return _j(out)
 
 
 @mcp.tool()
@@ -212,6 +218,41 @@ def related(doc_id: int, k: int = 8) -> str:
     if deny:
         return deny
     return _j(S.related(db(), embedder(), doc_id, k=k, exclude_roots=_excl()))
+
+
+@mcp.tool()
+def file_url(doc_id: int) -> str:
+    """URL that serves this document's ORIGINAL file, byte for byte, from this
+    same server (GET it with the SAME access token you use for MCP, as
+    ?token=*** or Authorization header). Subject to the admin's download
+    policy: some folders and some profiles are restricted — an error here is
+    policy, not a bug, and never retry-loop. On stdio transport no URL exists
+    (local-only); then the note gives the on-disk path for the machine owner."""
+    deny = _doc_guard(doc_id)
+    if deny:
+        return deny
+    import os
+    from .access import CURRENT, ORIGIN, doc_root, download_block
+    from .config import Config
+    root = doc_root(db(), doc_id)
+    if root is False:
+        return _j({"error": "no such document"})
+    block = download_block(Config.load(cfg().data_dir), CURRENT.get(), root)
+    if block:
+        return _j({"error": block})
+    row = db().execute("SELECT path, title FROM docs WHERE id=?", (doc_id,)).fetchone()
+    path = row["path"]
+    size = os.path.getsize(path) if os.path.isfile(path) else None
+    origin = ORIGIN.get()
+    if not origin:
+        return _j({"url": None, "path_on_server": str(path),
+                   "note": "stdio transport has no HTTP URL; this is the file's "
+                           "path on the machine running the server"})
+    return _j({"url": f"{origin}/file/{doc_id}",
+               "name": os.path.basename(path),
+               "bytes": size,
+               "how": "GET it with your MCP access token (?token=*** or "
+                      "Authorization: Bearer)"})
 
 
 @mcp.tool()

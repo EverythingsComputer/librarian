@@ -229,14 +229,15 @@ def _serve_invocation() -> str:
 
 def api_state(cfg: Config) -> dict:
     from .db import connect
+    from .export import export_progress_snapshot
     from .ingest import progress_snapshot
     out = {"libraries": [], "indexed": cfg.db_path.exists(),
-           "sync": progress_snapshot()}
+           "sync": progress_snapshot(), "export": export_progress_snapshot()}
     if not out["indexed"]:
         # no db yet — but a FIRST build may be running right now; progress
         # matters most then, so sync is already in `out`
         out["libraries"] = [{"name": r.name, "path": str(r.path), "enabled": r.enabled,
-                             "docs": 0} for r in cfg.roots]
+                             "files": r.files, "docs": 0} for r in cfg.roots]
         return out
     db = connect(cfg.db_path, read_only=True)
     row = db.execute("SELECT value v FROM meta WHERE key='last_build'").fetchone()
@@ -263,6 +264,7 @@ def api_state(cfg: Config) -> dict:
         c = counts.get(r.name, {"n": 0, "d": 0})
         missing = not r.path.is_dir()
         out["libraries"].append({"name": r.name, "path": str(r.path), "enabled": r.enabled,
+                                 "files": r.files,
                                  "docs": (c["n"] or 0) - (c["d"] or 0), "missing": missing})
     for root_name, c in counts.items():  # indexed but no longer configured
         if root_name and root_name not in known:
@@ -279,6 +281,8 @@ def api_state(cfg: Config) -> dict:
                ocr={"enabled": bool(cfg.ocr),
                     "available": bool(tool_path("tesseract") and tool_path("pdftoppm"))},
                sync=progress_snapshot(),
+               export=export_progress_snapshot(),
+               export_result=_EXPORT_RESULT,
                db_mb=round(cfg.db_path.stat().st_size / 1e6, 1))
     return out
 
@@ -333,11 +337,11 @@ def api_profiles(cfg: Config, body: dict | None = None) -> dict:
     every change up within one request (mtime-reloaded resolver), no restart."""
     from .config import (add_profile, delete_profile, rename_profile,
                          reset_profile_token, set_profile_enabled,
-                         set_profile_roots)
+                         set_profile_files, set_profile_roots)
     folders = [r.name for r in cfg.roots]
     if body is None:
-        return {"profiles": [{"name": p.name, "roots": p.roots, "enabled": p.enabled}
-                             for p in cfg.profiles],
+        return {"profiles": [{"name": p.name, "roots": p.roots, "enabled": p.enabled,
+                              "files": bool(p.files)} for p in cfg.profiles],
                 "folders": folders}
     act = body.get("action", "")
     name = str(body.get("name", "")).strip()
@@ -358,12 +362,74 @@ def api_profiles(cfg: Config, body: dict | None = None) -> dict:
     elif act == "enable":
         prof = set_profile_enabled(cfg, name, bool(body.get("enabled")))
         out.update(name=prof.name, enabled=prof.enabled)
+    elif act == "files":
+        prof = set_profile_files(cfg, name, bool(body.get("enabled")))
+        out.update(name=prof.name, files=prof.files)
     elif act == "roots":
         prof = set_profile_roots(cfg, name, roots)
         out.update(name=prof.name, roots=prof.roots)
     else:
         raise ValueError("unknown profiles action")
     return out
+
+
+def api_folder_files(cfg: Config, name: str, enabled: bool) -> dict:
+    """v0.4.0 folder master switch for raw-file downloads."""
+    from .config import set_root_files
+    root = set_root_files(cfg, name, enabled)
+    return {"name": root.name, "files": root.files}
+
+
+# ------------------------------------------------------ searchable-copy export
+
+_EXPORT_RESULT: dict = {}    # last finished run (shown in the UI after reload)
+
+
+def api_export(cfg: Config, body: dict) -> dict:
+    """POST /api/export. action=start {scope:all|folders|docs, folders[], docs[],
+    out?} launches the job in a worker thread and answers immediately (long
+    OCR runs!); progress then rides /api/state -> export. action=cancel stops
+    after the current page. Running the SAME job again resumes (existing
+    copies are kept, not re-OCR'd)."""
+    from .export import (EXPORT_CANCEL, EXPORT_LOCK, export_progress_snapshot,
+                         run_export)
+    act = body.get("action", "")
+    if act == "cancel":
+        EXPORT_CANCEL.set()
+        return {"ok": True, "note": "will stop after the current page"}
+    if act != "start":
+        raise ValueError("action must be 'start' or 'cancel'")
+    if not EXPORT_LOCK.acquire(blocking=False):
+        return {"started": False, "busy": True,
+                "message": "an export is already running"}
+    scope = body.get("scope", "")
+    folders = [str(x) for x in (body.get("folders") or [])]
+    docs = [int(x) for x in (body.get("docs") or [])]
+    out_dir = str(body.get("out") or "").strip() or None
+    global _EXPORT_RESULT
+    _EXPORT_RESULT = {"running": True}
+
+    def _job():
+        global _EXPORT_RESULT
+        try:
+            rep = run_export(cfg, out_dir=out_dir,
+                             doc_ids=docs or None,
+                             roots=folders or None,
+                             whole_library=(scope == "all"))
+            _EXPORT_RESULT = {"finished": True, "exported": rep["exported"],
+                              "out_dir": rep["out_dir"],
+                              "skipped_text": rep["skipped_already_text"],
+                              "skipped_existing": rep["skipped_existing"],
+                              "failed": rep["failed"], "cancelled": rep["cancelled"],
+                              "seconds": rep["seconds"]}
+        except Exception as e:
+            _EXPORT_RESULT = {"finished": True, "error": f"{type(e).__name__}: {e}"}
+        finally:
+            EXPORT_LOCK.release()
+
+    threading.Thread(target=_job, daemon=True).start()
+    return {"started": True,
+            "note": "progress shows below the button; you can close this page"}
 
 
 # ------------------------------------------------------------------ HTTP
@@ -433,7 +499,15 @@ input:checked+.sl{background:var(--ok)}input:checked+.sl:before{transform:transl
 .pchip span{border:1px solid var(--line);background:#10151c;border-radius:99px;padding:3px 12px;
  font-size:12.5px;color:var(--mut);cursor:pointer;user-select:none;transition:all .12s}
 .pchip input:checked+span{border-color:#6b5116;background:#2a2110;color:var(--acc)}
-.pbtns{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;max-width:200px}
+.pbtns{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;max-width:220px}
+button.ok{background:#173021;color:var(--ok);border:1px solid #244a32}
+.dlcol{display:flex;flex-direction:column;align-items:center;gap:2px;margin-left:6px}
+.dllbl{font-size:12px;color:#b7c2ce;line-height:1}
+.sw.mini{width:30px;height:16px}
+.sw.mini .sl:before{width:12px;height:12px;left:2px;top:2px}
+.sw.mini input:checked+.sl:before{transform:translateX(14px)}
+a.dl{color:var(--acc);text-decoration:none;font-size:12.5px;margin-left:8px}
+a.dl:hover{text-decoration:underline}
 #tokbox{display:none;margin:12px 0;padding:12px 13px;border:1px solid #6b5116;border-radius:10px;background:#241d0e}
 #toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:50}
 .toast{background:#202934;border:1px solid var(--line);padding:10px 14px;border-radius:10px;
@@ -470,6 +544,19 @@ input:checked+.sl{background:var(--ok)}input:checked+.sl:before{transform:transl
 <p class="lbl">A profile's token can be replaced ("new token") or switched off at any time — instantly, no server restart. Profiles are read-only; syncing stays yours.</p>
 </section>
 
+<section><h2>Searchable copies <em>bake OCR into portable .searchable.pdf COPIES — originals never touched</em></h2>
+<p class="lbl" style="margin:0 0 10px">Scanned PDFs get a copy carrying a real invisible text layer, so the OCR travels with the file to any device and any reader. Files that are already searchable are left alone.</p>
+<div class="pchips" style="margin:0">
+ <label class="pchip"><input type="radio" name="exscope" value="all" checked onchange="exScope()"><span>Entire library</span></label>
+ <label class="pchip"><input type="radio" name="exscope" value="folders" onchange="exScope()"><span>Selected folders</span></label>
+</div>
+<div class="pchips" id="exFolders" style="display:none;margin-top:8px"></div>
+<div class="row"><input type="text" id="exOut" placeholder="Destination folder (default: ~/librarian/exports)">
+ <button id="exBtn" onclick="startExport()">Export copies</button>
+ <button id="exCancel" class="danger" style="display:none" onclick="cancelExport()">Cancel</button></div>
+<div id="exMsg" class="lbl"></div>
+</section>
+
 <section><h2>Connect an agent (MCP over the network)</h2>
 <div id="conn">loading…</div></section>
 </main><div id="toasts"></div><script>
@@ -500,8 +587,9 @@ async function refresh(){
  else w.style.display='none';
  $('libs').innerHTML=(s.libraries||[]).map(l=>`<div class="lib">
   <label class="sw"><input type="checkbox" ${l.enabled?'checked':''} onchange="toggle('${esc(l.name)}',this.checked)"><span class="sl"></span></label>
-  <div><div class="nm">${esc(l.name)} ${l.missing?'<span class="miss">(folder missing!)</span>':''}</div>
+  <div style="flex:1;min-width:0"><div class="nm">${esc(l.name)} ${l.missing?'<span class="miss">(folder missing!)</span>':''}</div>
   <div class="pth">${esc(l.path)}</div></div>
+  <div class="dlcol"><label class="sw mini" title="profile file downloads: master switch for this folder (you can always download)"><input type="checkbox" ${l.files!==false?'checked':''} onchange="ffiles('${esc(l.name)}',this.checked)"><span class="sl"></span></label><span class="dllbl">⤓</span></div>
   <div class="cnt">${l.docs} docs</div>
   <button class="danger tiny" onclick="del('${esc(l.name)}')">Remove</button></div>`).join('')||'<i>No folders yet</i>';
 }
@@ -535,13 +623,43 @@ async function regen(){if(document.getElementById('tval')&&!confirm('Generate a 
   toast('New admin token saved. '+d.note);conn();}catch(e){toast(e,true)}}
 let _folders=[];
 function chips(folders,chosen){return folders.map(f=>`<label class="pchip"><input type="checkbox" value="${esc(f)}" ${chosen.includes(f)?'checked':''}><span>${esc(f)}</span></label>`).join('')||'<span class="lbl">no folders yet</span>'}
+let _ep=null;
+function exScope(){document.querySelectorAll('#exFolders input').forEach(i=>i.checked=false);
+ $('exFolders').style.display=document.querySelector('input[name=exscope]:checked').value==='folders'?'flex':'none'}
+function exPoll(on){ if(on){ if(_ep)return; _ep=setInterval(async()=>{try{const s=await j('/api/state');paintExport(s)}catch(e){}},2500);} else if(_ep){clearInterval(_ep);_ep=null;} }
+function paintExport(s){
+ const x=s.export||{}; const r=s.export_result||{};
+ if(x.active){$('exBtn').disabled=true;$('exCancel').style.display='';
+  $('exMsg').textContent=`exporting ${x.done}/${x.total}: ${x.file||''} (${x.file_seconds||0}s on this file)`;
+  if(!_ep)exPoll(true);return;}
+ if(_ep){exPoll(false);}
+ $('exBtn').disabled=false;$('exCancel').style.display='none';
+ if(r.finished){let t=`${r.exported} searchable cop${r.exported==1?'y':'ies'} → ${r.out_dir}`;
+  if(r.skipped_text)t+=` · ${r.skipped_text} already searchable, left alone`;
+  if(r.skipped_existing)t+=` · ${r.skipped_existing} copies existed, kept`;
+  if(r.failed&&r.failed.length)t+=` · ${r.failed.length} FAILED`;
+  if(r.cancelled)t+=' · cancelled (press again to continue)';
+  if(r.error)t='export error: '+r.error;
+  t+=` · ${r.seconds||0}s`; $('exMsg').textContent=t;}
+}
+async function startExport(){const scope=document.querySelector('input[name=exscope]:checked').value;
+ const folders=picked('#exFolders');
+ if(scope==='folders'&&!folders.length){toast('Pick at least one folder',true);return}
+ try{const d=await j('/api/export',{action:'start',scope,folders,out:$('exOut').value.trim()});
+  if(d.busy){toast(d.message,true);return}
+  $('exMsg').textContent='export started — this can take a long time; the page can stay open or go, the job keeps running';exPoll(true)}
+ catch(e){toast(e,true)}}
+async function cancelExport(){try{await j('/api/export',{action:'cancel'});$('exMsg').textContent='cancelling after current page…'}catch(e){toast(e,true)}}
 async function profs(){
  try{const d=await j('/api/profiles');_folders=d.folders||[];
   $('newRoots').innerHTML=chips(_folders,[]);
+  $('exFolders').innerHTML=chips(_folders,[]);
   $('profs').innerHTML=d.profiles.map(p=>`<div class="prof" data-name="${esc(p.name)}">
    <label class="sw"><input type="checkbox" ${p.enabled?'checked':''} onchange="enProf('${esc(p.name)}',this.checked)"><span class="sl"></span></label>
    <div class="pmain"><div class="nm">${esc(p.name)}
-    <button class="sec tiny" onclick="renProf('${esc(p.name)}')">rename</button></div>
+    <button class="sec tiny" onclick="renProf('${esc(p.name)}')">rename</button>
+    <button class="${p.files?'ok':'sec'} tiny" title="grant/revoke downloads of the actual files (folders can still block)"
+     onclick="pfiles('${esc(p.name)}',${p.files?'false':'true'})">⤓ ${p.files?'downloads on':'text only'}</button></div>
     <div class="pchips">${chips(_folders,p.roots)}</div></div>
    <div class="pbtns"><button class="sec tiny" onclick="resetProf('${esc(p.name)}')">new token</button>
     <button class="danger tiny" onclick="delProf('${esc(p.name)}')">delete</button></div></div>`).join('')
@@ -559,6 +677,10 @@ async function addProf(){const n=$('pname').value.trim();if(!n){toast('Give the 
   $('pname').value='';$('newRoots').querySelectorAll('input').forEach(i=>i.checked=false);
   showTok(d.name,d.token);profs();}catch(e){toast(e,true)}}
 async function setRoots(n,roots){try{await j('/api/profiles',{action:'roots',name:n,roots})}catch(e){toast(e,true);profs()}}
+async function pfiles(n,on){try{await j('/api/profiles',{action:'files',name:n,enabled:on});
+ toast(on?'Downloads allowed for '+n+' (unless the folder blocks them)':'Text-only for '+n)}catch(e){toast(e,true)}profs()}
+async function ffiles(n,on){try{await j('/api/folderfiles',{name:n,enabled:on});
+ toast(on?'⤓ enabled for '+n:'⤓ blocked for '+n+' (all profiles)')}catch(e){toast(e,true)}refresh()}
 async function enProf(n,on){try{await j('/api/profiles',{action:'enable',name:n,enabled:on});
  toast(on?'Profile enabled — token works again':'Profile disabled — token rejected')}catch(e){toast(e,true)}profs()}
 async function renProf(n){const nn=prompt('New name for profile "'+n+'":',n);if(!nn||nn===n)return;
@@ -585,7 +707,8 @@ async function conn(){
      <code id="tval">${esc(c.token)}</code>
      <span class="cbtns"><button class="cp" onclick="regen()">regenerate</button>
      <button class="cp" onclick="cp('tval')">copy</button></span></div>
-     <p class="lbl">This page is reachable only from this machine (127.0.0.1). Use the URL above with this token yourself; friends and colleagues use the SAME URL with their own profile token (see “Shared access”). Changing the admin token takes effect when the MCP server restarts. New profile tokens work immediately.</p>`;
+     <p class="lbl">This page is reachable only from this machine (127.0.0.1). Use the URL above with this token yourself; friends and colleagues use the SAME URL with their own profile token (see “Shared access”). Changing the admin token takes effect when the MCP server restarts. New profile tokens work immediately.</p>
+     <p class="lbl">Agents can fetch original files too: <code style="font-size:12px">${esc(c.connect_url.split('/mcp')[0])}/file/&lt;doc_id&gt;</code> with the same token — governed by the ⤓ switches in “Library folders” (master) and “Shared access” (per profile).</p>`;
   else h+=`<p class="err">No admin token set — required before the server can start on a network address (profile tokens alone also work).</p>
      <button class="cp" onclick="regen()">generate a token now</button>`;
   $('conn').innerHTML=h;
@@ -595,10 +718,12 @@ $('q').addEventListener('keydown',async e=>{if(e.key!=='Enter')return;
  try{const hits=await j(`/api/search?q=${encodeURIComponent(q)}`);
   $('results').innerHTML=hits.length?hits.map(h=>`<div class="hit"><b>${esc(h.title)}</b>
   <span class="lbl"> · ${esc(h.label||'')} · doc ${h.doc_id}</span>
+  <a class="dl" href="/dl/${h.doc_id}" title="download the original file">⤓ file</a>
   <div class="lbl">${esc(h.folder)}</div><p>${esc(h.snippet)}</p></div>`).join('')
   :'<p class="lbl">no matches</p>'}
  catch(e){$('results').innerHTML=`<p class="err">${e}</p>`}});
 refresh();profs();conn();setInterval(conn,15000);
+j('/api/state').then(paintExport).catch(()=>{});   // resume export view after reload
 </script></body></html>"""
 
 
@@ -619,6 +744,46 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code: int = 200) -> None:
         self._send(code, json.dumps(obj, default=str).encode(), "application/json")
 
+    def _dl(self, cfg: Config, doc_id: str) -> None:
+        """v0.4.0 admin download: the UI is loopback-only, so this is the
+        local owner fetching their own file (MCP-side /file/<id> handles the
+        remote, policy-checked case)."""
+        import os
+        from urllib.parse import quote
+        if not doc_id.isdigit():
+            self._json({"error": "use /dl/<doc_id>"}, 404)
+            return
+        if not cfg.db_path.exists():
+            self._json({"error": "not indexed yet"}, 404)
+            return
+        from .db import connect
+        db = connect(cfg.db_path, read_only=True)
+        try:
+            row = db.execute("SELECT path FROM docs WHERE id=?", (int(doc_id),)).fetchone()
+        finally:
+            db.close()
+        if row is None or not os.path.isfile(row["path"]):
+            self._json({"error": "file not present on this machine"}, 404)
+            return
+        path = row["path"]
+        name = os.path.basename(path)
+        try:
+            size = os.path.getsize(path)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition",
+                             "attachment; filename*=UTF-8''" + quote(name))
+            self.end_headers()
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, OSError):
+            pass  # browser aborted
+
     def do_GET(self):
         u = urlparse(self.path)
         cfg = Config.load(self.cfg_dir)
@@ -631,6 +796,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_connection(cfg))
             elif u.path == "/api/profiles":
                 self._json(api_profiles(cfg))
+            elif u.path.startswith("/dl/"):
+                self._dl(cfg, u.path[len("/dl/"):])
             elif u.path == "/api/search":
                 qs = parse_qs(u.query)
                 q = (qs.get("q") or [""])[0]
@@ -664,6 +831,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_token(cfg, body.get("action", ""), body.get("value", "")))
             elif u.path == "/api/profiles":
                 self._json(api_profiles(cfg, body))
+            elif u.path == "/api/folderfiles":
+                self._json(api_folder_files(cfg, body.get("name", ""),
+                                            bool(body.get("enabled"))))
+            elif u.path == "/api/export":
+                self._json(api_export(cfg, body))
             elif u.path == "/api/remove":
                 self._json(api_remove(cfg, body.get("name", "")))
             else:

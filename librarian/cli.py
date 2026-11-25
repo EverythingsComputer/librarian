@@ -194,8 +194,72 @@ def cmd_profile(args):
             prof = set_profile_enabled(cfg, args.name, act == "enable")
             print(f"'{prof.name}' " + ("enabled — token works again"
                                        if prof.enabled else "disabled — token rejected (profile kept)"))
+        elif act == "files":
+            from .config import set_profile_files
+            prof = set_profile_files(cfg, args.name, not args.off)
+            print(f"'{prof.name}' file downloads: " +
+                  ("ALLOWED (folders may still block)" if prof.files
+                   else "BLOCKED (text access only)"))
     except ValueError as e:
         sys.exit(f"error: {e}")
+
+
+def cmd_export(args):
+    """v0.4.0: bake OCR into searchable COPIES (originals untouched)."""
+    import signal
+
+    from .export import EXPORT_CANCEL, EXPORT_LOCK, run_export
+    cfg = _cfg(args)
+    if not EXPORT_LOCK.acquire(blocking=False):
+        sys.exit("an export is already running in this server/UI")
+
+    def handler(sig, frame):
+        EXPORT_CANCEL.set()
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        print("\n!! stopping after current page (Ctrl-C again to force quit)", flush=True)
+    signal.signal(signal.SIGINT, handler)
+
+    doc_ids = [int(x) for x in args.docs.split(",") if x.strip()] if args.docs else None
+    roots = [x.strip() for x in args.folders.split(",") if x.strip()] if args.folders else None
+    try:
+        rep = run_export(cfg, out_dir=args.out, doc_ids=doc_ids, roots=roots,
+                         whole_library=args.all, print_lines=True)
+    except ValueError as e:
+        EXPORT_LOCK.release()
+        sys.exit(f"error: {e}")
+    EXPORT_LOCK.release()
+    if args.json:
+        _j(rep)
+        return
+    line = (f"Exported {rep['exported']} searchable cop"
+            f"{'y' if rep['exported'] == 1 else 'ies'} to {rep['out_dir']}")
+    extra = []
+    if rep["skipped_already_text"]:
+        extra.append(f"{rep['skipped_already_text']} already searchable (left alone)")
+    if rep["skipped_existing"]:
+        extra.append(f"{rep['skipped_existing']} copies already existed (kept)")
+    if rep["failed"]:
+        extra.append(f"{len(rep['failed'])} FAILED")
+    if rep["cancelled"]:
+        extra.append("CANCELLED — run again to continue where it stopped")
+    if extra:
+        line += ". " + "; ".join(extra)
+    line += f". Took {rep['seconds']}s."
+    print(line)
+    for f in rep["failed"]:
+        print(f"  ! {f['path']}: {f['error']}")
+
+
+def cmd_folder_files(args):
+    from .config import set_root_files
+    cfg = _cfg(args)
+    try:
+        root = set_root_files(cfg, args.name, not args.off)
+    except ValueError as e:
+        sys.exit(f"error: {e}")
+    print(f"'{root.name}' file downloads: " +
+          ("ALLOWED for profiles that hold the download grant" if root.files
+           else "BLOCKED for all profiles (folder master switch)"))
 
 
 def cmd_ui(args):
@@ -448,8 +512,26 @@ def main(argv=None):
     x.add_argument("name"); x.add_argument("--set", required=True, help="comma-separated folder names")
     x = pa.add_parser("enable", parents=[common]); x.add_argument("name")
     x = pa.add_parser("disable", parents=[common]); x.add_argument("name")
+    x = pa.add_parser("files", parents=[common],
+                      help="grant/revoke raw-file downloads for a profile")
+    x.add_argument("name"); x.add_argument("--off", action="store_true")
     for _x in pa.choices.values():
         _x.set_defaults(fn=cmd_profile)
+
+    p = sub.add_parser("folder-files", parents=[common],
+                       help="master switch: may ANY profile download files from a folder?")
+    p.add_argument("name")
+    p.add_argument("--off", action="store_true", help="block downloads from this folder")
+    p.set_defaults(fn=cmd_folder_files)
+
+    p = sub.add_parser("export", parents=[common],
+                       help="write searchable COPIES of scanned PDFs (originals untouched)")
+    p.add_argument("--all", action="store_true", help="entire library")
+    p.add_argument("--folders", default="", help="comma-separated folder names")
+    p.add_argument("--docs", default="", help="comma-separated doc ids")
+    p.add_argument("--out", default="", help="destination dir (default: <data>/exports)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_export)
     p = sub.add_parser("ui", parents=[common], help="local web page for maintenance + search")
     p.add_argument("--port", type=int, default=None,
                    help="default: 8765; if busy the default launch uses the next free port")
