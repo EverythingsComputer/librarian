@@ -52,15 +52,34 @@ def _ep(**kw) -> None:
     EXPORT_PROGRESS.update(base)
 
 
+def _file_text(path: str):
+    """True/False: does the FILE itself carry extractable text?
+    None if pdftotext can't answer (fall back to the index heuristic).
+    The index cannot answer this once OCR is on: an OCR'd scan shows
+    chars>0 exactly like a native text PDF, yet its file still has no
+    layer — and that is precisely what an export copy must add."""
+    bin = tool_path("pdftotext")
+    if not bin:
+        return None
+    try:
+        out = subprocess.run([bin, "-q", path, "-"], capture_output=True,
+                             text=True, errors="replace", timeout=180,
+                             env=tool_env(bin)).stdout
+    except Exception:
+        return None
+    return bool(out.strip())
+
+
 def exportable_docs(cfg: Config, doc_ids: list[int] | None = None,
-                    roots: list[str] | None = None) -> tuple[list[dict], list[dict]]:
-    """(candidates, skipped) — candidates are scanned PDFs (kind empty/chars==0)
-    with files present; skipped lists everything else that was asked for with a
-    reason, so the admin sees exactly what 'export' did and did not do."""
+                    roots: list[str] | None = None, report_progress=False):
+    """(candidates, skipped) — candidates are PDFs whose FILE has no text
+    layer (scanned, whether or not the index OCR'd it) with files present;
+    skipped lists everything else that was asked for with a reason, so the
+    admin sees exactly what 'export' did and did not do."""
     if not cfg.db_path.exists():
         return [], []
     db = connect(cfg.db_path, read_only=True)
-    conds, args = ["d.dup_of IS NULL"], []
+    conds, args = ["d.dup_of IS NULL", "lower(d.ext)='pdf'"], []
     if doc_ids:
         conds.append("d.id IN (" + ",".join("?" * len(doc_ids)) + ")")
         args += list(doc_ids)
@@ -68,19 +87,26 @@ def exportable_docs(cfg: Config, doc_ids: list[int] | None = None,
         conds.append("d.root IN (" + ",".join("?" * len(roots)) + ")")
         args += list(roots)
     rows = [dict(r) for r in db.execute(
-        f"SELECT d.id, d.path, d.root, d.title, d.kind, d.chars, d.ext FROM docs d "
+        f"SELECT d.id, d.path, d.root, d.title, d.kind, d.chars FROM docs d "
         f"WHERE {' AND '.join(conds)} ORDER BY d.root, d.path", args).fetchall()]
     db.close()
     cand, skip = [], []
-    for r in rows:
-        if (r["ext"] or "").lower() != "pdf":
-            skip.append({**r, "why": "not a PDF (already searchable text)"})
-        elif (r["chars"] or 0) > 0:
-            skip.append({**r, "why": "PDF already has a text layer"})
-        elif not os.path.isfile(r["path"]):
+    n = len(rows)
+    for i, r in enumerate(rows, 1):
+        if report_progress:
+            _ep(active=True, done=i - 1, total=n, file=Path(r["path"]).name,
+                detail="checking")
+        if not os.path.isfile(r["path"]):
             skip.append({**r, "why": "file missing on disk"})
+            continue
+        if (r["chars"] or 0) == 0:
+            cand.append(r)                    # no text anywhere: bake candidate
+            continue
+        has = _file_text(r["path"])           # index says text; does the FILE?
+        if has is False:
+            cand.append(r)                    # OCR lives only in the index
         else:
-            cand.append(r)
+            skip.append({**r, "why": "PDF already has a text layer"})
     return cand, skip
 
 
@@ -216,7 +242,8 @@ def run_export(cfg: Config, out_dir: str | Path | None = None,
             raise ValueError(f"unknown folder(s): {', '.join(bad)}. "
                              f"Known: {', '.join(sorted(known)) or '(none)'}")
     cand, skipped = exportable_docs(
-        cfg, doc_ids=doc_ids, roots=None if whole_library else roots)
+        cfg, doc_ids=doc_ids, roots=None if whole_library else roots,
+        report_progress=True)
     out = Path(out_dir or (cfg.data_dir / "exports")).expanduser()
     out.mkdir(parents=True, exist_ok=True)
     EXPORT_CANCEL.clear()

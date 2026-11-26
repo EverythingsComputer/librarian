@@ -292,7 +292,18 @@ PYX
   run folder-files Pc --off >/dev/null          # but the FOLDER blocks first
 
   sha_before=$(sha256sum "$T/docs/scan-only.pdf" | cut -d' ' -f1)
-  timeout 300 "$AI" --appimage-extract-and-run export --folders docs --out "$T/xout" --json > "$T/x.json" 2>&1 \
+  # target the ORIGINAL scanned doc by id: the prune-guard test left text-
+  # layered synthetic copies of it in other folders (legit 'already
+  # searchable' skips — not candidates for export)
+  SD_ID=$("$PY" - <<PYP
+import sqlite3
+row = sqlite3.connect("$LIBRARIAN_DATA/index.db").execute(
+    "SELECT id FROM docs WHERE path=?", ("$T/docs/scan-only.pdf",)).fetchone()
+print(row[0] if row else "")
+PYP
+)
+  [ -n "$SD_ID" ] || { echo "SMOKE FAIL: cannot locate scan-only.pdf doc id"; exit 1; }
+  timeout 300 "$AI" --appimage-extract-and-run export --docs "$SD_ID" --out "$T/xout" --json > "$T/x.json" 2>&1 \
     || { echo "SMOKE FAIL: export CLI errored"; cat "$T/x.json"; exit 1; }
   grep -q '"exported": 1' "$T/x.json" || { echo "SMOKE FAIL: export JSON has no exported:1"; cat "$T/x.json"; exit 1; }
   [ -f "$T/xout/scan-only.searchable.pdf" ] || { echo "SMOKE FAIL: no searchable copy"; exit 1; }
@@ -300,7 +311,7 @@ PYX
     || { echo "SMOKE FAIL: searchable copy has NO extractable text layer"; exit 1; }
   sha_after=$(sha256sum "$T/docs/scan-only.pdf" | cut -d' ' -f1)
   [ "$sha_before" = "$sha_after" ] || { echo "SMOKE FAIL: export MODIFIED the original file"; exit 1; }
-  run export --folders docs --out "$T/xout" --json > "$T/x2.json" 2>&1
+  run export --docs "$SD_ID" --out "$T/xout" --json > "$T/x2.json" 2>&1
   grep -q '"skipped_existing": 1' "$T/x2.json" \
     || { echo "SMOKE FAIL: rerun re-exported an existing copy"; cat "$T/x2.json"; exit 1; }
   echo "   searchable copy carries real text; original byte-identical; rerun keeps it"

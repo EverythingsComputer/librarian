@@ -340,8 +340,21 @@ class _ExportTests(unittest.TestCase):
 
     def test_selection(self):
         self._seed()
+        # a THIRD doc: real scanned file, but DB says chars>0 because the
+        # index OCR'd it — only the file check reveals it needs a copy
+        import shutil
+        ocred = self.dir / "libs" / "Scanlib" / "ocred.pdf"
+        shutil.copyfile(self.scan, ocred)
+        from librarian.db import connect
+        db = connect(self.cfg.db_path)
+        db.execute("INSERT INTO docs(id,path,root,folder,kind,title,ext,size,mtime,chars)"
+                   " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                   (3, str(ocred), "Scanlib", "/", "pdf", "ocred.pdf", "pdf",
+                    ocred.stat().st_size, 0, 45))
+        db.commit()
+        db.close()
         cand, skipped = exportable_docs(self.cfg)
-        self.assertEqual([c["title"] for c in cand], ["scan-only.pdf"])
+        self.assertEqual(sorted(c["title"] for c in cand), ["ocred.pdf", "scan-only.pdf"])
         self.assertEqual(skipped[0]["why"], "PDF already has a text layer")
 
     def test_roundtrip(self):
